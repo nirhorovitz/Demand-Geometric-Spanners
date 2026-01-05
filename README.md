@@ -1,10 +1,10 @@
 # Demand-Geometric-Spanners
 
 In this project, we study the problem of constructing sparse geometric networks with weighted stretch. 
-Given a set $P$ of $n$ points in the Euclidean plane, a stretch parameter $t>1$, 
+Given a set $P$ of $n$ points in the Euclidean plane, a stretch parameter t > 1, 
 and an edge-demand function
-$   w : P \times P \rightarrow \mathbb{R}, \ \ 0 < w(p,q) \le 1, $
-our goal is to compute a graph $G=(P,E)$ satisfying the following properties:
+w : P * P -> (0,1]
+our goal is to compute a graph G = (P, E) satisfying the following properties:
 
 1. ### Edge-demand t-spanner.
    For every pair of points p, q ∈ P , the graph contains a path whose
