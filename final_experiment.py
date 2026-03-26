@@ -381,6 +381,25 @@ def _build_adj_np(edge_list: list, n: int, dist_np: np.ndarray) -> np.ndarray:
     return adj
 
 
+def _dijkstra_one(adj_np: np.ndarray, src: int, n: int) -> np.ndarray:
+    """Dijkstra from src using adjacency matrix. O(n^2), fully vectorized inner loop."""
+    d = np.full(n, np.inf)
+    d[src] = 0.0
+    visited = np.zeros(n, dtype=bool)
+    for _ in range(n):
+        # Pick unvisited vertex with smallest distance
+        masked = np.where(visited, np.inf, d)
+        u = int(np.argmin(masked))
+        if np.isinf(d[u]):
+            break
+        visited[u] = True
+        # Relax all neighbors (vectorized)
+        cand = d[u] + adj_np[u, :]
+        improved = cand < d
+        d = np.where(improved & ~visited, cand, d)
+    return d
+
+
 # ── Yao graph ─────────────────────────────────────────────────────────────────
 
 def yao_k_for_t(t: float) -> int:
@@ -481,13 +500,12 @@ def dgf_one_pass(
     t: float,
 ) -> tuple[list[tuple[int, int]], int]:
     """
-    Single-pass Descending Greedy Filter (DGF).
+    Single-pass Descending Greedy Filter (DGF) — optimized.
 
-    Process edges in non-ascending distance order (longest first).
-    For each edge: tentatively remove it; if any pair (r, s) lacks a t-path
-    in the remaining graph, reinsert it. ONE pass only — no rounds.
-
-    GPU speedup: sp stays on-device; only one boolean is transferred per iteration.
+    Three speedups over the naive approach:
+    1. Batch pre-filter: one FW call removes all edges not on any shortest path.
+    2. Incremental adjacency: O(1) update per edge instead of rebuilding.
+    3. Dijkstra pre-check: O(n^2) necessity test before O(n^3) FW.
 
     Returns:
         (remaining_edges, n_removed)
@@ -497,9 +515,30 @@ def dgf_one_pass(
 
     xp = cp if _CUDA else np
     sel = sorted(edges, key=lambda e: -dist_np[e[0], e[1]])
-    current = list(sel)
-    removed = 0
 
+    # ── Phase 1: batch pre-filter (one FW call) ──────────────────────────
+    adj = _build_adj_np(sel, n, dist_np)
+    sp_init = _fw_device(adj)
+
+    # Vectorized: keep only edges where sp[u,v] >= w (on a shortest path)
+    E_arr = np.array(sel, dtype=np.int64)
+    sp_vals = sp_init[E_arr[:, 0], E_arr[:, 1]]
+    if _CUDA:
+        sp_vals = cp.asnumpy(sp_vals)
+    w_vals = dist_np[E_arr[:, 0], E_arr[:, 1]]
+    keep_mask = sp_vals >= w_vals  # sp == w means on shortest path
+    n_batch_removed = int(np.sum(~keep_mask))
+
+    current_set = set()
+    for idx in np.where(keep_mask)[0]:
+        e = sel[idx]
+        current_set.add((min(e[0], e[1]), max(e[0], e[1])))
+    sel_filtered = [e for e in sel if (min(e[0], e[1]), max(e[0], e[1])) in current_set]
+
+    if n_batch_removed > 0:
+        tqdm.write(f"    batch pre-filter: removed {n_batch_removed}/{len(sel)} edges, {len(sel_filtered)} remain")
+
+    # ── Phase 2: one-by-one with incremental adj + Dijkstra pre-check ────
     # Precompute upper-triangle indices and dist on device — reused every iteration
     r_np, s_np = np.triu_indices(n, k=1)
     r_dev, s_dev = xp.asarray(r_np), xp.asarray(s_np)
@@ -510,16 +549,44 @@ def dgf_one_pass(
         v = xp.any(xp.isinf(sp_up) | (sp_up > t * dist_upper))
         return bool(v.get() if _CUDA else v)
 
-    for edge in tqdm(sel, desc="dgf", unit="edge", leave=False):
-        canon = (min(edge[0], edge[1]), max(edge[0], edge[1]))
-        without = [e for e in current if (min(e[0], e[1]), max(e[0], e[1])) != canon]
-        sp_without = _fw_device(_build_adj_np(without, n, dist_np))
-        if not _violation(sp_without):
-            current = without  # edge is redundant — remove it
-            removed += 1
-        # else: edge is necessary — leave it in current
+    # Build adj once from filtered edges; update incrementally
+    adj = _build_adj_np(sel_filtered, n, dist_np)
+    removed = 0
 
-    return current, removed
+    for edge in tqdm(sel_filtered, desc="dgf", unit="edge", leave=False):
+        u, v = edge[0], edge[1]
+        w = dist_np[u, v]
+
+        # Tentatively remove edge
+        adj[u, v] = np.inf
+        adj[v, u] = np.inf
+
+        # Quick O(n^2) necessity check: Dijkstra from u
+        d_from_u = _dijkstra_one(adj, u, n)
+        if d_from_u[v] > t * w:
+            # Edge is necessary — put it back, skip expensive FW
+            adj[u, v] = w
+            adj[v, u] = w
+            continue
+
+        # Edge might be removable — need full FW to check ALL pairs
+        sp_new = _fw_device(adj)
+        if _violation(sp_new):
+            # Necessary after all — put it back
+            adj[u, v] = w
+            adj[v, u] = w
+        else:
+            removed += 1  # confirmed removable
+
+    # Reconstruct remaining edge list from adj
+    remaining = []
+    for e in sel_filtered:
+        u, v = e[0], e[1]
+        if not np.isinf(adj[u, v]):
+            remaining.append(e)
+
+    total_removed = n_batch_removed + removed
+    return remaining, total_removed
 
 
 # ── Minimality check ──────────────────────────────────────────────────────────
