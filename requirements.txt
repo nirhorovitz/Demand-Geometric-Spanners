@@ -1,0 +1,5 @@
+# Spanner project dependencies
+numpy>=1.24
+matplotlib>=3.5
+tqdm>=4.0
+jsonschema>=4.0
