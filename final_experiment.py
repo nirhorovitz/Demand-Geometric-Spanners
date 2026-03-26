@@ -626,6 +626,36 @@ N = 5000
 BASE_SEED = 42
 
 
+def _print_table(algo_results: dict[str, Any], t: float) -> None:
+    """Print the results table to the console (rows=algorithms, cols=metrics)."""
+    algo_names = list(algo_results.keys())
+    headers = ["algorithm"] + [_humanize_metric_name(m) for m in METRIC_NAMES]
+
+    # Build cell strings
+    rows = []
+    for name in algo_names:
+        row = [name]
+        for metric in METRIC_NAMES:
+            row.append(_format_metric_value(algo_results[name].get(metric), metric))
+        rows.append(row)
+
+    # Column widths
+    col_widths = [max(len(headers[c]), *(len(rows[r][c]) for r in range(len(rows))))
+                  for c in range(len(headers))]
+
+    sep = "+-" + "-+-".join("-" * w for w in col_widths) + "-+"
+    def fmt_row(cells):
+        return "| " + " | ".join(cells[c].ljust(col_widths[c]) for c in range(len(cells))) + " |"
+
+    print(f"\n  Results for t={t}:")
+    print(f"  {sep}")
+    print(f"  {fmt_row(headers)}")
+    print(f"  {sep}")
+    for row in rows:
+        print(f"  {fmt_row(row)}")
+    print(f"  {sep}\n")
+
+
 def _save_results(out: Path, algo_results: dict[str, Any]) -> None:
     """Write results.json atomically (temp file + rename) so partial runs are safe."""
     tmp = out / "results.json.tmp"
@@ -697,6 +727,7 @@ def main() -> None:
             # Save after every algorithm so an interruption loses at most one result
             _save_results(out, algo_results)
 
+        _print_table(algo_results, t)
         _plot_table(out, P, algo_results, t)
 
         t_elapsed = time.perf_counter() - t0_t
