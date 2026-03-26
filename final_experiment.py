@@ -340,35 +340,37 @@ def _to_jsonable(obj: Any) -> Any:
 
 # ── Fast vectorized Floyd-Warshall ────────────────────────────────────────────
 
+def _adj_to_scipy(adj_np: np.ndarray) -> np.ndarray:
+    """Convert inf-based adjacency to scipy format (0 = no edge). O(n²)."""
+    return np.where(np.isinf(adj_np), 0.0, adj_np)
+
+
 def _fw(adj_np: np.ndarray) -> np.ndarray:
     """
-    Vectorized Floyd-Warshall. Uses CuPy (GPU) if available, else NumPy.
-    Mathematically identical to core/metrics._floyd_warshall.
-
-    Key: for each k, tmp[i,j] = d[i,k] + d[k,j] is computed from the PRE-update
-    d, then d is updated in-place. This is correct FW because d[k,k]=0 means
-    updating d[i,k] or d[k,j] during pass k is a no-op.
+    Floyd-Warshall APSP.  GPU → CuPy vectorized loop.  CPU → scipy C-level FW.
     """
-    xp = cp if _CUDA else np
-    d = xp.asarray(adj_np, dtype=np.float64)
-    n = d.shape[0]
-    tmp = xp.empty((n, n), dtype=np.float64)
-    for k in range(n):
-        xp.add(d[:, k : k + 1], d[k : k + 1, :], out=tmp)
-        xp.minimum(d, tmp, out=d)
-    return cp.asnumpy(d) if _CUDA else d
+    if _CUDA:
+        d = cp.asarray(adj_np, dtype=np.float64)
+        n = d.shape[0]
+        tmp = cp.empty((n, n), dtype=np.float64)
+        for k in range(n):
+            cp.add(d[:, k : k + 1], d[k : k + 1, :], out=tmp)
+            cp.minimum(d, tmp, out=d)
+        return cp.asnumpy(d)
+    return sp_shortest_path(_adj_to_scipy(adj_np), method='FW', directed=False)
 
 
 def _fw_device(adj_np: np.ndarray):
     """Like _fw but keeps result on the xp device — no GPU→CPU transfer."""
-    xp = cp if _CUDA else np
-    d = xp.asarray(adj_np, dtype=np.float64)
-    n = d.shape[0]
-    tmp = xp.empty((n, n), dtype=np.float64)
-    for k in range(n):
-        xp.add(d[:, k:k+1], d[k:k+1, :], out=tmp)
-        xp.minimum(d, tmp, out=d)
-    return d  # stays on device
+    if _CUDA:
+        d = cp.asarray(adj_np, dtype=np.float64)
+        n = d.shape[0]
+        tmp = cp.empty((n, n), dtype=np.float64)
+        for k in range(n):
+            cp.add(d[:, k:k+1], d[k:k+1, :], out=tmp)
+            cp.minimum(d, tmp, out=d)
+        return d  # stays on device
+    return sp_shortest_path(_adj_to_scipy(adj_np), method='FW', directed=False)
 
 
 # ── Adjacency matrix builder (shared by DGF and violation check) ──────────────
