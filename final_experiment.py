@@ -19,11 +19,61 @@ Usage (full run):     set N = 5000, then run python experiment_yao.py
 
 from __future__ import annotations
 
+import re
+import subprocess
+import sys
+
+
+def _install(pkg: str) -> None:
+    print(f"  Installing {pkg}...", flush=True)
+    subprocess.check_call([sys.executable, "-m", "pip", "install", pkg],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def _bootstrap() -> None:
+    """Install missing dependencies before any third-party imports."""
+    required = [
+        ("numpy",      "numpy>=1.24"),
+        ("matplotlib", "matplotlib>=3.5"),
+        ("tqdm",       "tqdm>=4.0"),
+    ]
+    for module, spec in required:
+        try:
+            __import__(module)
+        except ImportError:
+            _install(spec)
+
+    # CuPy: only attempt if an NVIDIA GPU is present.
+    # Detect CUDA version from nvidia-smi, then install the matching wheel.
+    try:
+        import cupy  # noqa: F401 — already installed, nothing to do
+    except ImportError:
+        try:
+            out = subprocess.run(
+                ["nvidia-smi"], capture_output=True, text=True, timeout=10
+            ).stdout
+            match = re.search(r"CUDA Version:\s*(\d+)\.\d+", out)
+            if match:
+                major = int(match.group(1))
+                if major >= 12:
+                    cupy_pkg = "cupy-cuda12x"
+                elif major == 11:
+                    cupy_pkg = "cupy-cuda11x"
+                elif major == 10:
+                    cupy_pkg = "cupy-cuda102"
+                else:
+                    cupy_pkg = None
+                if cupy_pkg:
+                    _install(cupy_pkg)
+        except Exception:
+            pass  # No GPU / nvidia-smi not found — CuPy skipped, numpy fallback used
+
+
+_bootstrap()
+
 import json
 import math
 import time
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -32,11 +82,15 @@ import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 from tqdm import tqdm
 
+try:
+    import cupy as cp
+    _CUDA = True
+except ImportError:
+    _CUDA = False
+
 # ── Project imports (read-only utilities, no pipeline) ────────────────────────
 from core.metrics import (
     _euclidean_distances,
-    _build_adjacency,
-    _floyd_warshall,
     apsp_add_edge,
     apsp_shortest_path_after_removal,
     _compute_degrees,
@@ -282,6 +336,27 @@ def _to_jsonable(obj: Any) -> Any:
     return obj
 
 
+# ── Fast vectorized Floyd-Warshall ────────────────────────────────────────────
+
+def _fw(adj_np: np.ndarray) -> np.ndarray:
+    """
+    Vectorized Floyd-Warshall. Uses CuPy (GPU) if available, else NumPy.
+    Mathematically identical to core/metrics._floyd_warshall.
+
+    Key: for each k, tmp[i,j] = d[i,k] + d[k,j] is computed from the PRE-update
+    d, then d is updated in-place. This is correct FW because d[k,k]=0 means
+    updating d[i,k] or d[k,j] during pass k is a no-op.
+    """
+    xp = cp if _CUDA else np
+    d = xp.asarray(adj_np, dtype=np.float64)
+    n = d.shape[0]
+    tmp = xp.empty((n, n), dtype=np.float64)
+    for k in range(n):
+        xp.add(d[:, k : k + 1], d[k : k + 1, :], out=tmp)
+        xp.minimum(d, tmp, out=d)
+    return cp.asnumpy(d) if _CUDA else d
+
+
 # ── Yao graph ─────────────────────────────────────────────────────────────────
 
 def yao_k_for_t(t: float) -> int:
@@ -297,35 +372,47 @@ def yao_k_for_t(t: float) -> int:
 
 def yao_graph(points: np.ndarray, k: int) -> np.ndarray:
     """
-    Build undirected Yao_k graph.
+    Build undirected Yao_k graph (vectorized).
 
-    For each point p and each of k equal-angle cones, add directed edge
-    p -> nearest neighbor in that cone (if any). Return symmetric closure
-    as sorted (i<j) edge array.
+    For each of k equal-angle cones, find every point's nearest neighbour in
+    that cone via vectorized argmin — no Python loop over points.
+    Return symmetric closure as sorted (i<j) edge array.
 
     NOTE: when k >= n-1 (e.g. t=1.001 -> large k, n=5000), the Yao graph
     degenerates to the complete graph; reported as-is.
     """
     n = points.shape[0]
+    xp = cp if _CUDA else np
     cone_angle = 2.0 * math.pi / k
-    dist = _euclidean_distances(points)
+
+    pts = xp.asarray(points)
+    x, y = pts[:, 0], pts[:, 1]
+    # angle_mat[i,j] = angle of vector from i to j
+    dx = x[np.newaxis, :] - x[:, np.newaxis]   # (n, n)
+    dy = y[np.newaxis, :] - y[:, np.newaxis]   # (n, n)
+    angle_mat = xp.arctan2(dy, dx) % (2.0 * math.pi)
+
+    dist_mat = xp.asarray(_euclidean_distances(points))
+    diag = xp.arange(n)
+    dist_mat[diag, diag] = xp.inf  # exclude self-edges
+
     edges: set[tuple[int, int]] = set()
-    for p in tqdm(range(n), desc="yao_graph", unit="pt", leave=False):
-        for c in range(k):
-            lo = c * cone_angle
-            hi = (c + 1) * cone_angle
-            best_q, best_d = -1, math.inf
-            for q in range(n):
-                if q == p:
-                    continue
-                angle = math.atan2(
-                    points[q, 1] - points[p, 1],
-                    points[q, 0] - points[p, 0],
-                ) % (2.0 * math.pi)
-                if lo <= angle < hi and dist[p, q] < best_d:
-                    best_d, best_q = dist[p, q], q
-            if best_q >= 0:
-                edges.add((min(p, best_q), max(p, best_q)))
+    for c in tqdm(range(k), desc="yao_graph", unit="cone", leave=False):
+        lo = c * cone_angle
+        hi = (c + 1) * cone_angle
+        in_cone = (angle_mat >= lo) & (angle_mat < hi)       # (n, n) bool
+        masked = xp.where(in_cone, dist_mat, xp.inf)         # (n, n)
+        best_j = xp.argmin(masked, axis=1)                   # (n,)
+        best_d = masked[xp.arange(n), best_j]                # (n,)
+        valid = ~xp.isinf(best_d)
+
+        valid_np = cp.asnumpy(valid) if _CUDA else np.asarray(valid)
+        best_j_np = cp.asnumpy(best_j) if _CUDA else np.asarray(best_j)
+
+        for i in np.where(valid_np)[0]:
+            j = int(best_j_np[i])
+            edges.add((min(i, j), max(i, j)))
+
     if not edges:
         return np.empty((0, 2), dtype=np.int64)
     return np.array(sorted(edges), dtype=np.int64)
@@ -335,54 +422,37 @@ def yao_graph(points: np.ndarray, k: int) -> np.ndarray:
 
 def _check_all_pairs_violation(
     edges_without: list[tuple[int, int]],
-    dist: np.ndarray,
-    w: np.ndarray,
+    dist_np: np.ndarray,
+    w: np.ndarray,   # always ones; kept for API compatibility
     n: int,
     t: float,
-    max_workers: int | None = None,
 ) -> bool:
     """
-    Return True iff any pair (r, s) with r < s violates the t-spanner property
-    in the graph defined by edges_without:
-        w[r,s] * sp[r,s] > t * dist[r,s]   OR   sp[r,s] == inf
+    Return True iff any pair (r, s) violates the t-spanner property in the
+    graph defined by edges_without:  sp[r,s] > t * dist[r,s]  OR  sp[r,s] == inf
 
-    Uses ThreadPoolExecutor with fast-break via threading.Event.
+    Vectorized: builds adjacency with fancy indexing, runs _fw (GPU if available),
+    checks the full upper triangle in one operation — no Python pair loop.
     """
     if n < 2:
         return False
 
-    E = (
-        np.array(edges_without, dtype=np.int64)
-        if edges_without
-        else np.empty((0, 2), dtype=np.int64)
-    )
-    adj = _build_adjacency(E, n, dist)
-    sp = _floyd_warshall(adj)
+    # Build adjacency matrix with fast fancy indexing (always on CPU)
+    adj = np.full((n, n), np.inf, dtype=np.float64)
+    np.fill_diagonal(adj, 0.0)
+    if edges_without:
+        E = np.array(edges_without, dtype=np.int64)
+        adj[E[:, 0], E[:, 1]] = dist_np[E[:, 0], E[:, 1]]
+        adj[E[:, 1], E[:, 0]] = dist_np[E[:, 0], E[:, 1]]
 
-    pairs = [(r, s) for r in range(n) for s in range(r + 1, n)]
-    workers = max_workers or 4
-    chunk_size = max(1, len(pairs) // workers)
+    # Floyd-Warshall (vectorized, on GPU if available) → numpy result
+    sp = _fw(adj)
 
-    stop = threading.Event()
-    found = threading.Event()
-
-    def check_chunk(chunk: list[tuple[int, int]]) -> None:
-        for r, s in chunk:
-            if stop.is_set():
-                return
-            if np.isinf(sp[r, s]) or w[r, s] * sp[r, s] > t * dist[r, s]:
-                found.set()
-                stop.set()
-                return
-
-    chunks = [pairs[i : i + chunk_size] for i in range(0, len(pairs), chunk_size)]
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = [ex.submit(check_chunk, c) for c in chunks]
-        for f in as_completed(futs):
-            if found.is_set():
-                break
-
-    return found.is_set()
+    # Single vectorized check over upper triangle (w is all-ones)
+    r_idx, s_idx = np.triu_indices(n, k=1)
+    sp_upper = sp[r_idx, s_idx]
+    dist_upper = dist_np[r_idx, s_idx]
+    return bool(np.any(np.isinf(sp_upper) | (sp_upper > t * dist_upper)))
 
 
 def dgf_one_pass(
@@ -565,6 +635,8 @@ def _save_results(out: Path, algo_results: dict[str, Any]) -> None:
 
 def main() -> None:
     BASE_OUT = Path(f"results_final_experiment_n={N}")
+    accel = "GPU (CuPy)" if _CUDA else "CPU (NumPy)"
+    print(f"Acceleration: {accel}")
     print(f"Yao experiment: n={N}, t-values={T_VALUES}")
     print(f"Output directory: {BASE_OUT}\n")
 
