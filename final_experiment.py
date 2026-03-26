@@ -98,7 +98,6 @@ from core.metrics import (
     compute_metrics,
 )
 from core.mst import mst_weight
-from algorithms.greedy import run as greedy_run
 
 # ── Plotting constants ────────────────────────────────────────────────────────
 NA_STR = "N/A"
@@ -357,6 +356,31 @@ def _fw(adj_np: np.ndarray) -> np.ndarray:
     return cp.asnumpy(d) if _CUDA else d
 
 
+def _fw_device(adj_np: np.ndarray):
+    """Like _fw but keeps result on the xp device — no GPU→CPU transfer."""
+    xp = cp if _CUDA else np
+    d = xp.asarray(adj_np, dtype=np.float64)
+    n = d.shape[0]
+    tmp = xp.empty((n, n), dtype=np.float64)
+    for k in range(n):
+        xp.add(d[:, k:k+1], d[k:k+1, :], out=tmp)
+        xp.minimum(d, tmp, out=d)
+    return d  # stays on device
+
+
+# ── Adjacency matrix builder (shared by DGF and violation check) ──────────────
+
+def _build_adj_np(edge_list: list, n: int, dist_np: np.ndarray) -> np.ndarray:
+    """Build a CPU adjacency matrix from a list of (i, j) edge tuples."""
+    adj = np.full((n, n), np.inf, dtype=np.float64)
+    np.fill_diagonal(adj, 0.0)
+    if edge_list:
+        E = np.array(edge_list, dtype=np.int64)
+        adj[E[:, 0], E[:, 1]] = dist_np[E[:, 0], E[:, 1]]
+        adj[E[:, 1], E[:, 0]] = dist_np[E[:, 0], E[:, 1]]
+    return adj
+
+
 # ── Yao graph ─────────────────────────────────────────────────────────────────
 
 def yao_k_for_t(t: float) -> int:
@@ -438,12 +462,7 @@ def _check_all_pairs_violation(
         return False
 
     # Build adjacency matrix with fast fancy indexing (always on CPU)
-    adj = np.full((n, n), np.inf, dtype=np.float64)
-    np.fill_diagonal(adj, 0.0)
-    if edges_without:
-        E = np.array(edges_without, dtype=np.int64)
-        adj[E[:, 0], E[:, 1]] = dist_np[E[:, 0], E[:, 1]]
-        adj[E[:, 1], E[:, 0]] = dist_np[E[:, 0], E[:, 1]]
+    adj = _build_adj_np(edges_without, n, dist_np)
 
     # Floyd-Warshall (vectorized, on GPU if available) → numpy result
     sp = _fw(adj)
@@ -457,7 +476,7 @@ def _check_all_pairs_violation(
 
 def dgf_one_pass(
     edges: list[tuple[int, int]],
-    dist: np.ndarray,
+    dist_np: np.ndarray,
     n: int,
     t: float,
 ) -> tuple[list[tuple[int, int]], int]:
@@ -468,21 +487,34 @@ def dgf_one_pass(
     For each edge: tentatively remove it; if any pair (r, s) lacks a t-path
     in the remaining graph, reinsert it. ONE pass only — no rounds.
 
+    GPU speedup: sp stays on-device; only one boolean is transferred per iteration.
+
     Returns:
         (remaining_edges, n_removed)
     """
     if len(edges) <= 1:
         return list(edges), 0
 
-    w = np.ones((n, n), dtype=np.float64)
-    sel = sorted(edges, key=lambda e: -dist[e[0], e[1]])
+    xp = cp if _CUDA else np
+    sel = sorted(edges, key=lambda e: -dist_np[e[0], e[1]])
     current = list(sel)
     removed = 0
+
+    # Precompute upper-triangle indices and dist on device — reused every iteration
+    r_np, s_np = np.triu_indices(n, k=1)
+    r_dev, s_dev = xp.asarray(r_np), xp.asarray(s_np)
+    dist_upper = xp.asarray(dist_np)[r_dev, s_dev]
+
+    def _violation(sp_dev):
+        sp_up = sp_dev[r_dev, s_dev]
+        v = xp.any(xp.isinf(sp_up) | (sp_up > t * dist_upper))
+        return bool(v.get() if _CUDA else v)
 
     for edge in tqdm(sel, desc="dgf", unit="edge", leave=False):
         canon = (min(edge[0], edge[1]), max(edge[0], edge[1]))
         without = [e for e in current if (min(e[0], e[1]), max(e[0], e[1])) != canon]
-        if not _check_all_pairs_violation(without, dist, w, n, t):
+        sp_without = _fw_device(_build_adj_np(without, n, dist_np))
+        if not _violation(sp_without):
             current = without  # edge is redundant — remove it
             removed += 1
         # else: edge is necessary — leave it in current
@@ -509,14 +541,63 @@ def check_minimality(
     return removed == 0
 
 
-# ── Six algorithm wrappers ────────────────────────────────────────────────────
+# ── GPU-aware greedy ──────────────────────────────────────────────────────────
 
-ALGO_CONFIG: dict[str, Any] = {"progress": True}
+def _greedy_local(points: np.ndarray, t: float, E_input=None) -> np.ndarray:
+    """
+    GPU-aware greedy t-spanner. Replaces greedy_run for final_experiment calls.
+
+    Keeps sp on device; APSP update is one vectorized broadcast per added edge
+    instead of the Python double loop in apsp_add_edge.
+    """
+    from algorithms.base import resolve_candidates
+    n = points.shape[0]
+    if n <= 1:
+        return np.empty((0, 2), dtype=np.int64)
+
+    xp = cp if _CUDA else np
+    dist_np = _euclidean_distances(points)
+    candidates = resolve_candidates(points, E_input)
+    if candidates.shape[0] == 0:
+        return np.empty((0, 2), dtype=np.int64)
+
+    lengths = dist_np[candidates[:, 0], candidates[:, 1]]
+    candidates = candidates[np.argsort(lengths)]
+
+    selected = []
+    sp = None  # APSP on device, initialised on first edge
+
+    for idx in tqdm(range(len(candidates)), desc="greedy", unit="edge", leave=False):
+        i, j = int(candidates[idx, 0]), int(candidates[idx, 1])
+        w = float(dist_np[i, j])
+
+        if sp is None:
+            delta = np.inf
+        else:
+            val = sp[i, j]
+            delta = float(val.get() if _CUDA else val)
+
+        if np.isinf(delta) or delta > t * w:
+            selected.append((i, j))
+            if sp is None:
+                sp = xp.full((n, n), xp.inf, dtype=np.float64)
+                sp[xp.arange(n), xp.arange(n)] = 0.0
+            # Vectorized APSP update (replaces apsp_add_edge Python double loop)
+            cand = xp.minimum(
+                sp[:, i:i+1] + w + sp[j:j+1, :],
+                sp[:, j:j+1] + w + sp[i:i+1, :]
+            )
+            xp.minimum(sp, cand, out=sp)
+
+    return np.array(selected, dtype=np.int64) if selected else np.empty((0, 2), dtype=np.int64)
+
+
+# ── Six algorithm wrappers ────────────────────────────────────────────────────
 
 
 def algo_greedy(points: np.ndarray, t: float) -> np.ndarray:
     """Algorithm 1: standard greedy t-spanner."""
-    return greedy_run(points, t, config=ALGO_CONFIG)
+    return _greedy_local(points, t)
 
 
 def algo_dgf(points: np.ndarray, t: float, dist: np.ndarray) -> np.ndarray:
@@ -534,7 +615,7 @@ def algo_yao(yao_t_edges: np.ndarray) -> np.ndarray:
 
 def algo_sqrt_greedy_dgf(points: np.ndarray, t: float, dist: np.ndarray) -> np.ndarray:
     """Algorithm 4: greedy(√t) -> DGF(t)."""
-    stage1 = greedy_run(points, math.sqrt(t), config=ALGO_CONFIG)
+    stage1 = _greedy_local(points, math.sqrt(t))
     edge_list = [(int(e[0]), int(e[1])) for e in stage1]
     n = points.shape[0]
     result, _ = dgf_one_pass(edge_list, dist, n, t)
@@ -559,7 +640,7 @@ def algo_yao_greedy_t(
     t: float,
 ) -> np.ndarray:
     """Algorithm 6: t-Yao -> greedy(t, E=yao_t). Reuses precomputed yao_t_edges."""
-    return greedy_run(points, t, E_input=yao_t_edges, config=ALGO_CONFIG)
+    return _greedy_local(points, t, E_input=yao_t_edges)
 
 
 # ── Plot helper ───────────────────────────────────────────────────────────────
