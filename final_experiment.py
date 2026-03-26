@@ -82,6 +82,9 @@ import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 from tqdm import tqdm
 
+import scipy.sparse as sp_sparse
+from scipy.sparse.csgraph import shortest_path as sp_shortest_path, dijkstra as sp_dijkstra
+
 try:
     import cupy as cp
     _CUDA = True
@@ -381,23 +384,24 @@ def _build_adj_np(edge_list: list, n: int, dist_np: np.ndarray) -> np.ndarray:
     return adj
 
 
-def _dijkstra_one(adj_np: np.ndarray, src: int, n: int) -> np.ndarray:
-    """Dijkstra from src using adjacency matrix. O(n^2), fully vectorized inner loop."""
-    d = np.full(n, np.inf)
-    d[src] = 0.0
-    visited = np.zeros(n, dtype=bool)
-    for _ in range(n):
-        # Pick unvisited vertex with smallest distance
-        masked = np.where(visited, np.inf, d)
-        u = int(np.argmin(masked))
-        if np.isinf(d[u]):
-            break
-        visited[u] = True
-        # Relax all neighbors (vectorized)
-        cand = d[u] + adj_np[u, :]
-        improved = cand < d
-        d = np.where(improved & ~visited, cand, d)
-    return d
+def _build_sparse_adj(edge_list: list, n: int, dist_np: np.ndarray) -> sp_sparse.lil_matrix:
+    """Build scipy lil_matrix from edge list. O(m) construction."""
+    g = sp_sparse.lil_matrix((n, n), dtype=np.float64)
+    for u, v in edge_list:
+        w = dist_np[u, v]
+        g[u, v] = w
+        g[v, u] = w
+    return g
+
+
+def _dijkstra_one(adj, src: int, n: int) -> np.ndarray:
+    """Dijkstra from src. Accepts sparse (scipy) or dense (numpy) adjacency."""
+    if sp_sparse.issparse(adj):
+        return sp_dijkstra(adj.tocsr(), indices=[src]).ravel()
+    # Dense: convert to sparse (inf → absent, 0 diag → absent)
+    finite = np.isfinite(adj) & (adj > 0)
+    csr = sp_sparse.csr_matrix(np.where(finite, adj, 0.0))
+    return sp_dijkstra(csr, indices=[src]).ravel()
 
 
 # ── Yao graph ─────────────────────────────────────────────────────────────────
@@ -516,15 +520,25 @@ def dgf_one_pass(
     xp = cp if _CUDA else np
     sel = sorted(edges, key=lambda e: -dist_np[e[0], e[1]])
 
-    # ── Phase 1: batch pre-filter (one FW call) ──────────────────────────
-    adj = _build_adj_np(sel, n, dist_np)
-    sp_init = _fw_device(adj)
+    # Dual-mode: sparse Dijkstra for small edge sets, dense FW for large ones
+    use_sparse = len(sel) < 4 * n
+
+    # ── Phase 1: batch pre-filter (one APSP call) ────────────────────────
+    if use_sparse:
+        lil = _build_sparse_adj(sel, n, dist_np)
+        sp_init_np = sp_shortest_path(lil.tocsr(), directed=False)
+    else:
+        adj = _build_adj_np(sel, n, dist_np)
+        sp_init = _fw_device(adj)
 
     # Vectorized: keep only edges where sp[u,v] >= w (on a shortest path)
     E_arr = np.array(sel, dtype=np.int64)
-    sp_vals = sp_init[E_arr[:, 0], E_arr[:, 1]]
-    if _CUDA:
-        sp_vals = cp.asnumpy(sp_vals)
+    if use_sparse:
+        sp_vals = sp_init_np[E_arr[:, 0], E_arr[:, 1]]
+    else:
+        sp_vals = sp_init[E_arr[:, 0], E_arr[:, 1]]
+        if _CUDA:
+            sp_vals = cp.asnumpy(sp_vals)
     w_vals = dist_np[E_arr[:, 0], E_arr[:, 1]]
     keep_mask = sp_vals >= w_vals  # sp == w means on shortest path
     n_batch_removed = int(np.sum(~keep_mask))
@@ -538,52 +552,88 @@ def dgf_one_pass(
     if n_batch_removed > 0:
         tqdm.write(f"    batch pre-filter: removed {n_batch_removed}/{len(sel)} edges, {len(sel_filtered)} remain")
 
-    # ── Phase 2: one-by-one with incremental adj + Dijkstra pre-check ────
-    # Precompute upper-triangle indices and dist on device — reused every iteration
+    # ── Phase 2: one-by-one with Dijkstra pre-check ─────────────────────
+    # Precompute upper-triangle indices and dist — reused every iteration
     r_np, s_np = np.triu_indices(n, k=1)
-    r_dev, s_dev = xp.asarray(r_np), xp.asarray(s_np)
-    dist_upper = xp.asarray(dist_np)[r_dev, s_dev]
+    dist_upper_np = dist_np[r_np, s_np]
 
-    def _violation(sp_dev):
-        sp_up = sp_dev[r_dev, s_dev]
-        v = xp.any(xp.isinf(sp_up) | (sp_up > t * dist_upper))
-        return bool(v.get() if _CUDA else v)
+    def _violation_np(sp_mat):
+        """Check violation using numpy array (works for both paths)."""
+        sp_up = sp_mat[r_np, s_np]
+        return bool(np.any(np.isinf(sp_up) | (sp_up > t * dist_upper_np)))
 
-    # Build adj once from filtered edges; update incrementally
-    adj = _build_adj_np(sel_filtered, n, dist_np)
-    removed = 0
+    if use_sparse:
+        # ── Sparse path: scipy Dijkstra (C-level) ───────────────────────
+        lil = _build_sparse_adj(sel_filtered, n, dist_np)
+        removed = 0
 
-    for edge in tqdm(sel_filtered, desc="dgf", unit="edge", leave=False):
-        u, v = edge[0], edge[1]
-        w = dist_np[u, v]
+        for edge in tqdm(sel_filtered, desc="dgf(sparse)", unit="edge", leave=False):
+            u, v = edge[0], edge[1]
+            w = dist_np[u, v]
 
-        # Tentatively remove edge
-        adj[u, v] = np.inf
-        adj[v, u] = np.inf
+            # Tentatively remove edge
+            lil[u, v] = 0
+            lil[v, u] = 0
 
-        # Quick O(n^2) necessity check: Dijkstra from u
-        d_from_u = _dijkstra_one(adj, u, n)
-        if d_from_u[v] > t * w:
-            # Edge is necessary — put it back, skip expensive FW
-            adj[u, v] = w
-            adj[v, u] = w
-            continue
+            # Quick necessity check: Dijkstra from u, O(E log n) in C
+            d_from_u = sp_dijkstra(lil.tocsr(), indices=[u]).ravel()
+            if d_from_u[v] > t * w:
+                lil[u, v] = w
+                lil[v, u] = w
+                continue
 
-        # Edge might be removable — need full FW to check ALL pairs
-        sp_new = _fw_device(adj)
-        if _violation(sp_new):
-            # Necessary after all — put it back
-            adj[u, v] = w
-            adj[v, u] = w
-        else:
-            removed += 1  # confirmed removable
+            # Full APSP check via sparse Dijkstra
+            sp_new = sp_shortest_path(lil.tocsr(), directed=False)
+            if _violation_np(sp_new):
+                lil[u, v] = w
+                lil[v, u] = w
+            else:
+                removed += 1
 
-    # Reconstruct remaining edge list from adj
-    remaining = []
-    for e in sel_filtered:
-        u, v = e[0], e[1]
-        if not np.isinf(adj[u, v]):
-            remaining.append(e)
+        # Reconstruct remaining edges from sparse matrix
+        remaining = []
+        for e in sel_filtered:
+            u, v = e[0], e[1]
+            if lil[u, v] != 0:
+                remaining.append(e)
+    else:
+        # ── Dense path: GPU/CPU FW (unchanged) ──────────────────────────
+        r_dev, s_dev = xp.asarray(r_np), xp.asarray(s_np)
+        dist_upper_dev = xp.asarray(dist_np)[r_dev, s_dev]
+
+        def _violation_dev(sp_dev):
+            sp_up = sp_dev[r_dev, s_dev]
+            v = xp.any(xp.isinf(sp_up) | (sp_up > t * dist_upper_dev))
+            return bool(v.get() if _CUDA else v)
+
+        adj = _build_adj_np(sel_filtered, n, dist_np)
+        removed = 0
+
+        for edge in tqdm(sel_filtered, desc="dgf", unit="edge", leave=False):
+            u, v = edge[0], edge[1]
+            w = dist_np[u, v]
+
+            adj[u, v] = np.inf
+            adj[v, u] = np.inf
+
+            d_from_u = _dijkstra_one(adj, u, n)
+            if d_from_u[v] > t * w:
+                adj[u, v] = w
+                adj[v, u] = w
+                continue
+
+            sp_new = _fw_device(adj)
+            if _violation_dev(sp_new):
+                adj[u, v] = w
+                adj[v, u] = w
+            else:
+                removed += 1
+
+        remaining = []
+        for e in sel_filtered:
+            u, v = e[0], e[1]
+            if not np.isinf(adj[u, v]):
+                remaining.append(e)
 
     total_removed = n_batch_removed + removed
     return remaining, total_removed
