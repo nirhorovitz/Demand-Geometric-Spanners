@@ -693,7 +693,9 @@ def dgf_one_pass(
                             uses[edge_key].add(pair)
                         cur = prev
 
-        for edge in tqdm(sel_filtered, desc="dgf", unit="edge", leave=False):
+        shorter_half_start = len(sel_filtered) // 2
+
+        for edge_idx, edge in enumerate(tqdm(sel_filtered, desc="dgf", unit="edge", leave=False)):
             u, v = edge[0], edge[1]
             w = dist_np[u, v]
             key = (min(u, v), max(u, v))
@@ -714,15 +716,32 @@ def dgf_one_pass(
             sparse_adj[u, v] = 0
             sparse_adj[v, u] = 0
 
-            # Check each dependent pair via targeted Dijkstra
-            necessary = False
-            dijkstra_cache: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+            # Reuse one CSR conversion for all source queries of this edge.
+            csr_current = sparse_adj.tocsr()
 
-            for (r, s) in pairs:
+            # Check each dependent pair via targeted Dijkstra.
+            # Process (u,v) pair first when present for earlier exits.
+            pair_list = list(pairs)
+            if key in pairs:
+                pair_list = [key] + [p for p in pair_list if p != key]
+
+            split_pred_mode = edge_idx >= shorter_half_start
+            necessary = False
+            dist_cache: dict[int, np.ndarray] = {}
+            pred_cache: dict[int, np.ndarray] = {}
+
+            for (r, s) in pair_list:
                 src = r
-                if src not in dijkstra_cache:
-                    dijkstra_cache[src] = _dijkstra_with_pred_sparse(sparse_adj, src)
-                d_src = dijkstra_cache[src][0]
+                if src not in dist_cache:
+                    if split_pred_mode:
+                        dist_cache[src] = sp_dijkstra(csr_current, indices=[src]).ravel()
+                    else:
+                        d_src, pred_src = sp_dijkstra(
+                            csr_current, indices=[src], return_predecessors=True
+                        )
+                        dist_cache[src] = d_src.ravel()
+                        pred_cache[src] = pred_src[0]
+                d_src = dist_cache[src]
                 if d_src[s] > t * dist_np[r, s]:
                     necessary = True
                     break
@@ -736,15 +755,13 @@ def dgf_one_pass(
 
             # Removable — update uses for re-routed pairs
             removed += 1
-            for (r, s) in pairs:
-                if r in dijkstra_cache:
-                    pred = dijkstra_cache[r][1]
-                    _trace_and_update_uses(pred, r, s, uses)
-                elif s in dijkstra_cache:
-                    pred = dijkstra_cache[s][1]
-                    _trace_and_update_uses(pred, s, r, uses)
-                # else: pair was checked via a shared source — its route
-                # will be stale in uses but that's harmless (extra checks)
+            for (r, s) in pair_list:
+                if r not in pred_cache:
+                    _, pred_src = sp_dijkstra(
+                        csr_current, indices=[r], return_predecessors=True
+                    )
+                    pred_cache[r] = pred_src[0]
+                _trace_and_update_uses(pred_cache[r], r, s, uses)
             uses.pop(key, None)
 
             # Periodically rebuild uses to purge stale entries
