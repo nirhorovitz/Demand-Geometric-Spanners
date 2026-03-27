@@ -955,21 +955,28 @@ def main() -> None:
         print(f"=== t = {t} (seed {BASE_SEED + idx}) ===")
         t0_t = time.perf_counter()
 
-        rng = np.random.default_rng(BASE_SEED + idx)
-        P = rng.uniform(0.0, 1.0, (N, 2))
-
         out = BASE_OUT / f"t={t}"
         out.mkdir(parents=True, exist_ok=True)
-        (out / "points.json").write_text(json.dumps(P.tolist()))
+
+        # --- Resume detection ---
+        results_file = out / "results.json"
+        points_file = out / "points.json"
+        algo_results: dict[str, dict[str, Any]] = {}
+
+        if results_file.exists():
+            algo_results = json.loads(results_file.read_text())
+
+        if points_file.exists():
+            P = np.array(json.loads(points_file.read_text()))
+        else:
+            rng = np.random.default_rng(BASE_SEED + idx)
+            P = rng.uniform(0.0, 1.0, (N, 2))
+            points_file.write_text(json.dumps(P.tolist()))
 
         dist = _euclidean_distances(P)
 
         # Compute yao(t) once — shared by algorithms 3, 5, and 6
-        k_t = yao_k_for_t(t)
-        print(f"  Yao k={k_t} for t={t}", flush=True)
-        t0_yao = time.perf_counter()
-        yao_t = yao_graph(P, k_t)
-        print(f"  yao_graph: {len(yao_t)} edges, {(time.perf_counter()-t0_yao)*1000:.0f} ms")
+        yao_t = None  # default; computed below only if needed
 
         RUNS = [
             ("greedy",          lambda: algo_greedy(P, t)),
@@ -980,8 +987,29 @@ def main() -> None:
             ("yao_greedy_t",    lambda: algo_yao_greedy_t(yao_t, P, t)),
         ]
 
-        algo_results: dict[str, dict[str, Any]] = {}
-        for name, fn in tqdm(RUNS, desc=f"t={t}", unit="algo"):
+        done = set(algo_results.keys())
+        missing_runs = [(name, fn) for name, fn in RUNS if name not in done]
+
+        if not missing_runs:
+            print(f"  All algorithms already done, skipping")
+            _print_table(algo_results, t)
+            t_elapsed = time.perf_counter() - t0_t
+            print(f"  t={t} total: {t_elapsed:.1f}s\n")
+            continue
+
+        if done:
+            print(f"  Resuming: {len(done)}/6 done, running {len(missing_runs)} remaining")
+
+        # Compute yao graph only if any yao-dependent algorithm is missing
+        yao_dependent = {"yao", "yao_dgf", "yao_greedy_t"}
+        if any(name in yao_dependent for name, _ in missing_runs):
+            k_t = yao_k_for_t(t)
+            print(f"  Yao k={k_t} for t={t}", flush=True)
+            t0_yao = time.perf_counter()
+            yao_t = yao_graph(P, k_t)
+            print(f"  yao_graph: {len(yao_t)} edges, {(time.perf_counter()-t0_yao)*1000:.0f} ms")
+
+        for name, fn in tqdm(missing_runs, desc=f"t={t}", unit="algo"):
             print(f"  Running {name}...", end=" ", flush=True)
             t0 = time.perf_counter()
             edges = fn()
