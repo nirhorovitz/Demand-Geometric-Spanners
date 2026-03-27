@@ -789,6 +789,12 @@ def _greedy_local(points: np.ndarray, t: float, E_input=None) -> np.ndarray:
 
     Keeps sp on device; APSP update is one vectorized broadcast per added edge
     instead of the Python double loop in apsp_add_edge.
+
+    When E_input is provided (greedy on a t-spanner), uses the modified check:
+        add edge iff  δ_{E_curr}(p,q) > √t · λ_{E_input}(p,q)
+    where λ_{E_input} is the shortest-path distance in the input graph.
+    Otherwise (E_input=None, full graph), uses the standard check:
+        add edge iff  δ_{E_curr}(p,q) > t · |pq|
     """
     from algorithms.base import resolve_candidates
     n = points.shape[0]
@@ -800,6 +806,16 @@ def _greedy_local(points: np.ndarray, t: float, E_input=None) -> np.ndarray:
     candidates = resolve_candidates(points, E_input)
     if candidates.shape[0] == 0:
         return np.empty((0, 2), dtype=np.int64)
+
+    # When E_input is provided, precompute APSP of the input graph
+    # and use the modified threshold: √t · λ_{E_input}(p,q)
+    sp_input = None
+    sqrt_t = math.sqrt(t)
+    if E_input is not None:
+        adj_input = _build_adj_np(
+            [(int(e[0]), int(e[1])) for e in E_input], n, dist_np
+        )
+        sp_input = _fw(adj_input)
 
     lengths = dist_np[candidates[:, 0], candidates[:, 1]]
     candidates = candidates[np.argsort(lengths)]
@@ -817,7 +833,12 @@ def _greedy_local(points: np.ndarray, t: float, E_input=None) -> np.ndarray:
             val = sp[i, j]
             delta = float(val.get() if _CUDA else val)
 
-        if np.isinf(delta) or delta > t * w:
+        if sp_input is not None:
+            threshold = sqrt_t * sp_input[i, j]
+        else:
+            threshold = t * w
+
+        if np.isinf(delta) or delta > threshold:
             selected.append((i, j))
             if sp is None:
                 sp = xp.full((n, n), xp.inf, dtype=np.float64)
