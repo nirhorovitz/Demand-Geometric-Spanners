@@ -87,8 +87,9 @@ from scipy.sparse.csgraph import shortest_path as sp_shortest_path, dijkstra as 
 
 try:
     import cupy as cp
+    cp.array([1.0])  # verify GPU is actually usable
     _CUDA = True
-except ImportError:
+except Exception:
     _CUDA = False
 
 # ── Project imports (read-only utilities, no pipeline) ────────────────────────
