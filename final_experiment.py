@@ -415,6 +415,34 @@ def _dijkstra_with_pred(adj_np: np.ndarray, src: int) -> tuple[np.ndarray, np.nd
     return d.ravel(), pred[0]
 
 
+def _dijkstra_with_pred_sparse(sparse_adj: sp_sparse.spmatrix, src: int) -> tuple[np.ndarray, np.ndarray]:
+    """Dijkstra from src on a sparse adjacency matrix (avoids dense→sparse conversion)."""
+    d, pred = sp_dijkstra(sparse_adj.tocsr(), indices=[src], return_predecessors=True)
+    return d.ravel(), pred[0]
+
+
+def _rebuild_uses(sparse_adj: sp_sparse.spmatrix, n: int, existing_keys: set) -> dict:
+    """Rebuild uses mapping from scratch via full APSP with predecessors."""
+    csr = sparse_adj.tocsr()
+    _, predecessors = sp_dijkstra(csr, return_predecessors=True)
+    uses: dict[tuple[int, int], set[tuple[int, int]]] = {}
+    for key in existing_keys:
+        uses[key] = set()
+    for r in range(n):
+        for s in range(r + 1, n):
+            pair = (r, s)
+            cur = s
+            while cur != r and cur >= 0:
+                prev = int(predecessors[r, cur])
+                if prev < 0:
+                    break
+                edge_key = (min(prev, cur), max(prev, cur))
+                if edge_key in uses:
+                    uses[edge_key].add(pair)
+                cur = prev
+    return uses
+
+
 def _trace_and_update_uses(pred: np.ndarray, r: int, s: int, uses: dict) -> None:
     """Trace SP from r to s via predecessor array. Add (r,s) to uses for each edge on path."""
     pair = (min(r, s), max(r, s))
@@ -625,7 +653,9 @@ def dgf_one_pass(
     else:
         # ── Dense path: edge-dependency tracking ─────────────────────────
         adj = _build_adj_np(sel_filtered, n, dist_np)
+        sparse_adj = _build_sparse_adj(sel_filtered, n, dist_np)
         removed = 0
+        rebuild_interval = max(n, 500)
 
         # Initialize uses via APSP with predecessor tracking.
         # For K_n (complete graph), this reduces to uses[(u,v)] = {(u,v)}
@@ -673,12 +703,16 @@ def dgf_one_pass(
                 # Edge not on any current SP — removable instantly
                 adj[u, v] = np.inf
                 adj[v, u] = np.inf
+                sparse_adj[u, v] = 0
+                sparse_adj[v, u] = 0
                 removed += 1
                 continue
 
             # Tentatively remove edge
             adj[u, v] = np.inf
             adj[v, u] = np.inf
+            sparse_adj[u, v] = 0
+            sparse_adj[v, u] = 0
 
             # Check each dependent pair via targeted Dijkstra
             necessary = False
@@ -687,7 +721,7 @@ def dgf_one_pass(
             for (r, s) in pairs:
                 src = r
                 if src not in dijkstra_cache:
-                    dijkstra_cache[src] = _dijkstra_with_pred(adj, src)
+                    dijkstra_cache[src] = _dijkstra_with_pred_sparse(sparse_adj, src)
                 d_src = dijkstra_cache[src][0]
                 if d_src[s] > t * dist_np[r, s]:
                     necessary = True
@@ -696,6 +730,8 @@ def dgf_one_pass(
             if necessary:
                 adj[u, v] = w
                 adj[v, u] = w
+                sparse_adj[u, v] = w
+                sparse_adj[v, u] = w
                 continue
 
             # Removable — update uses for re-routed pairs
@@ -710,6 +746,11 @@ def dgf_one_pass(
                 # else: pair was checked via a shared source — its route
                 # will be stale in uses but that's harmless (extra checks)
             uses.pop(key, None)
+
+            # Periodically rebuild uses to purge stale entries
+            if removed > 0 and removed % rebuild_interval == 0:
+                existing_keys = set(uses.keys())
+                uses = _rebuild_uses(sparse_adj, n, existing_keys)
 
         remaining = []
         for e in sel_filtered:
