@@ -9,4 +9,4 @@
 #SBATCH --mem=24G
 
 # -u is used to watch live progress and prevent buffered printing 
-python -u final_experiment.py --n 1000
+python -u final_experiment.py --n 5000

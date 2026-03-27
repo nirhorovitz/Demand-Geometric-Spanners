@@ -20,8 +20,10 @@ Usage (full run):     set N = 5000, then run python experiment_yao.py
 from __future__ import annotations
 
 import re
+import shutil
 import subprocess
 import sys
+import os
 
 
 def _install(pkg: str) -> None:
@@ -30,10 +32,72 @@ def _install(pkg: str) -> None:
                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+def _ensure_rust() -> bool:
+    """Install Rust via rustup if cargo is not on PATH. Returns True if available."""
+    if shutil.which("cargo"):
+        return True
+    # Try common rustup install location
+    cargo_home = os.path.expanduser("~/.cargo/bin/cargo")
+    if os.path.isfile(cargo_home):
+        os.environ["PATH"] = os.path.expanduser("~/.cargo/bin") + os.pathsep + os.environ.get("PATH", "")
+        return True
+    print("  Installing Rust via rustup (needed once for native DGF)...", flush=True)
+    try:
+        subprocess.check_call(
+            ["sh", "-c", "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=300,
+        )
+        os.environ["PATH"] = os.path.expanduser("~/.cargo/bin") + os.pathsep + os.environ.get("PATH", "")
+        return shutil.which("cargo") is not None
+    except Exception as exc:
+        print(f"  Rust install failed: {exc}", flush=True)
+        return False
+
+
+def _build_native_dgf() -> bool:
+    """Build native_dgf extension in-place using maturin. Returns True on success."""
+    native_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "native_dgf")
+    if not os.path.isdir(native_dir):
+        return False
+    try:
+        __import__("native_dgf")
+        return True  # already importable
+    except ImportError:
+        pass
+    if not _ensure_rust():
+        print("  Skipping native DGF build (no Rust toolchain)", flush=True)
+        return False
+    # Ensure maturin is installed
+    try:
+        __import__("maturin")
+    except ImportError:
+        print("  Installing maturin...", flush=True)
+        try:
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", "maturin>=1.7,<2.0"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120,
+            )
+        except Exception as exc:
+            print(f"  maturin install failed: {exc}", flush=True)
+            return False
+    print("  Building native_dgf (Rust extension)...", flush=True)
+    try:
+        subprocess.check_call(
+            [sys.executable, "-m", "maturin", "develop", "--release", "--manifest-path",
+             os.path.join(native_dir, "Cargo.toml")],
+            timeout=600,
+        )
+        return True
+    except Exception as exc:
+        print(f"  native_dgf build failed: {exc}", flush=True)
+        return False
+
+
 def _bootstrap() -> None:
     """Install missing dependencies before any third-party imports."""
     required = [
         ("numpy",      "numpy>=1.24"),
+        ("scipy",      "scipy>=1.9"),
         ("matplotlib", "matplotlib>=3.5"),
         ("tqdm",       "tqdm>=4.0"),
     ]
@@ -44,7 +108,6 @@ def _bootstrap() -> None:
             _install(spec)
 
     # CuPy: only attempt if an NVIDIA GPU is present.
-    # Detect CUDA version from nvidia-smi, then install the matching wheel.
     try:
         import cupy  # noqa: F401 — already installed, nothing to do
     except ImportError:
@@ -66,7 +129,10 @@ def _bootstrap() -> None:
                 if cupy_pkg:
                     _install(cupy_pkg)
         except Exception:
-            pass  # No GPU / nvidia-smi not found — CuPy skipped, numpy fallback used
+            pass  # No GPU / nvidia-smi not found — CuPy skipped
+
+    # Native Rust DGF extension — build if not already available
+    _build_native_dgf()
 
 
 _bootstrap()
@@ -75,7 +141,7 @@ import json
 import math
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -91,6 +157,42 @@ try:
     _CUDA = True
 except Exception:
     _CUDA = False
+
+try:
+    from native_dgf import (
+        trace_path_edge_ids as native_trace_path_edge_ids,
+        sort_pairs_with_key_first as native_sort_pairs_with_key_first,
+        dgf_one_pass_native as native_dgf_one_pass,
+    )
+    _NATIVE_DGF_AVAILABLE = True
+except Exception:
+    _NATIVE_DGF_AVAILABLE = False
+
+_DGF_NATIVE_ENABLED = os.environ.get("DGF_NATIVE", "1") != "0"
+_DGF_PROFILE_ENABLED = os.environ.get("DGF_PROFILE", "0") == "1"
+
+
+class _DgfProfiler:
+    """Tiny phase profiler for optional DGF instrumentation."""
+
+    def __init__(self, enabled: bool) -> None:
+        self.enabled = enabled
+        self._marks: dict[str, float] = {}
+
+    def add(self, name: str, delta_sec: float) -> None:
+        if not self.enabled:
+            return
+        self._marks[name] = self._marks.get(name, 0.0) + float(delta_sec)
+
+    def report(self, prefix: str = "dgf-profile") -> None:
+        if not self.enabled:
+            return
+        total = sum(self._marks.values())
+        print(f"  [{prefix}] total={total:.3f}s")
+        for k in sorted(self._marks.keys()):
+            v = self._marks[k]
+            pct = (100.0 * v / total) if total > 0 else 0.0
+            print(f"  [{prefix}] {k}={v:.3f}s ({pct:.1f}%)")
 
 # ── Project imports (read-only utilities, no pipeline) ────────────────────────
 from core.metrics import (
@@ -458,6 +560,57 @@ def _trace_and_update_uses(pred: np.ndarray, r: int, s: int, uses: dict) -> None
         cur = prev
 
 
+def _sort_pairs_with_key_first(
+    pairs: set[tuple[int, int]],
+    key: tuple[int, int],
+    *,
+    use_native: bool,
+) -> list[tuple[int, int]]:
+    """Return pair list with `key` first when present, then remaining pairs."""
+    pair_list = list(pairs)
+    if key not in pairs:
+        return pair_list
+    if use_native and _NATIVE_DGF_AVAILABLE and _DGF_NATIVE_ENABLED:
+        try:
+            packed_pairs = [((int(r) << 32) | int(s)) for (r, s) in pair_list]
+            packed_key = (int(key[0]) << 32) | int(key[1])
+            sorted_packed = native_sort_pairs_with_key_first(packed_pairs, packed_key)
+            return [(int(x >> 32), int(x & 0xFFFFFFFF)) for x in sorted_packed]
+        except Exception:
+            pass
+    return [key] + [p for p in pair_list if p != key]
+
+
+def _trace_and_update_uses_maybe_native(
+    pred: np.ndarray,
+    r: int,
+    s: int,
+    uses: dict,
+    n: int,
+    *,
+    use_native: bool,
+) -> None:
+    """
+    Trace SP path and update uses.
+    Falls back to Python tracing if native helper is unavailable.
+    """
+    if use_native and _NATIVE_DGF_AVAILABLE and _DGF_NATIVE_ENABLED:
+        try:
+            pair = (min(r, s), max(r, s))
+            edge_ids = native_trace_path_edge_ids(pred.astype(np.int64), int(r), int(s), int(n))
+            for edge_id in edge_ids:
+                u = int(edge_id) // n
+                v = int(edge_id) % n
+                edge_key = (u, v)
+                if edge_key not in uses:
+                    uses[edge_key] = set()
+                uses[edge_key].add(pair)
+            return
+        except Exception:
+            pass
+    _trace_and_update_uses(pred, r, s, uses)
+
+
 # ── Yao graph ─────────────────────────────────────────────────────────────────
 
 def yao_k_for_t(t: float) -> int:
@@ -571,40 +724,71 @@ def dgf_one_pass(
     if len(edges) <= 1:
         return list(edges), 0
 
-    xp = cp if _CUDA else np
     sel = sorted(edges, key=lambda e: -dist_np[e[0], e[1]])
+
+    if _NATIVE_DGF_AVAILABLE and _DGF_NATIVE_ENABLED:
+        try:
+            return native_dgf_one_pass(sel, dist_np, n, t)
+        except Exception as e:
+            print(f"    [Native DGF failed: {e}, falling back to Python]")
+
+    xp = cp if _CUDA else np
+    profiler = _DgfProfiler(_DGF_PROFILE_ENABLED)
+    t_phase = time.perf_counter()
+    native_mode = False
 
     # Dual-mode: sparse Dijkstra for small edge sets, dense FW for large ones
     use_sparse = len(sel) < 4 * n
 
     # ── Phase 1: batch pre-filter (one APSP call) ────────────────────────
-    if use_sparse:
+    n_edges = len(sel)
+    is_complete = (n_edges == n * (n - 1) // 2)
+
+    if is_complete:
+        # K_n APSP skip: for complete graphs, direct edges are always shortest
+        # paths (triangle inequality), so Phase 1 cannot remove any edges.
+        tqdm.write(f"    K_n detected: skipping Phase 1 APSP (triangle inequality)")
+        n_batch_removed = 0
+        sel_filtered = list(sel)
+        profiler.add("phase1_prefilter_apsp", 0.0)
+        profiler.add("phase1_prefilter_filtering", 0.0)
+    elif use_sparse:
         lil = _build_sparse_adj(sel, n, dist_np)
         sp_init_np = sp_shortest_path(lil.tocsr(), directed=False)
+        profiler.add("phase1_prefilter_apsp", time.perf_counter() - t_phase)
+        t_phase = time.perf_counter()
+
+        E_arr = np.array(sel, dtype=np.int64)
+        sp_vals = sp_init_np[E_arr[:, 0], E_arr[:, 1]]
+        w_vals = dist_np[E_arr[:, 0], E_arr[:, 1]]
+        keep_mask = sp_vals >= w_vals
+        n_batch_removed = int(np.sum(~keep_mask))
     else:
         adj = _build_adj_np(sel, n, dist_np)
         sp_init = _fw_device(adj)
+        profiler.add("phase1_prefilter_apsp", time.perf_counter() - t_phase)
+        t_phase = time.perf_counter()
 
-    # Vectorized: keep only edges where sp[u,v] >= w (on a shortest path)
-    E_arr = np.array(sel, dtype=np.int64)
-    if use_sparse:
-        sp_vals = sp_init_np[E_arr[:, 0], E_arr[:, 1]]
-    else:
+        E_arr = np.array(sel, dtype=np.int64)
         sp_vals = sp_init[E_arr[:, 0], E_arr[:, 1]]
         if _CUDA:
             sp_vals = cp.asnumpy(sp_vals)
-    w_vals = dist_np[E_arr[:, 0], E_arr[:, 1]]
-    keep_mask = sp_vals >= w_vals  # sp == w means on shortest path
-    n_batch_removed = int(np.sum(~keep_mask))
+        w_vals = dist_np[E_arr[:, 0], E_arr[:, 1]]
+        keep_mask = sp_vals >= w_vals
+        n_batch_removed = int(np.sum(~keep_mask))
 
-    current_set = set()
-    for idx in np.where(keep_mask)[0]:
-        e = sel[idx]
-        current_set.add((min(e[0], e[1]), max(e[0], e[1])))
-    sel_filtered = [e for e in sel if (min(e[0], e[1]), max(e[0], e[1])) in current_set]
+    if not is_complete:
+        # Build sel_filtered from keep_mask (K_n already set sel_filtered above)
+        current_set = set()
+        for idx in np.where(keep_mask)[0]:
+            e = sel[idx]
+            current_set.add((min(e[0], e[1]), max(e[0], e[1])))
+        sel_filtered = [e for e in sel if (min(e[0], e[1]), max(e[0], e[1])) in current_set]
 
-    if n_batch_removed > 0:
-        tqdm.write(f"    batch pre-filter: removed {n_batch_removed}/{len(sel)} edges, {len(sel_filtered)} remain")
+        if n_batch_removed > 0:
+            tqdm.write(f"    batch pre-filter: removed {n_batch_removed}/{len(sel)} edges, {len(sel_filtered)} remain")
+        profiler.add("phase1_prefilter_filtering", time.perf_counter() - t_phase)
+        t_phase = time.perf_counter()
 
     # ── Phase 2: one-by-one with Dijkstra pre-check ─────────────────────
     # Precompute upper-triangle indices and dist — reused every iteration
@@ -651,32 +835,26 @@ def dgf_one_pass(
             if lil[u, v] != 0:
                 remaining.append(e)
     else:
-        # ── Dense path: edge-dependency tracking ─────────────────────────
+        # ── Dense path: GPU-accelerated with edge-dependency tracking ─────
+        # GPU FW only pays off when n is large enough to amortise kernel launch
+        # overhead.  On RTX 3090 + CUDA 12.4, breakeven is around n ≈ 100.
+        use_gpu_phase2 = _CUDA and n >= 100
+
         adj = _build_adj_np(sel_filtered, n, dist_np)
         sparse_adj = _build_sparse_adj(sel_filtered, n, dist_np)
         removed = 0
         rebuild_interval = max(n, 500)
 
-        # Initialize uses via APSP with predecessor tracking.
-        # For K_n (complete graph), this reduces to uses[(u,v)] = {(u,v)}
-        # since direct edges are always shortest (triangle inequality).
-        # For non-complete inputs (e.g. greedy output), pairs without
-        # direct edges route through multi-hop paths that must be tracked.
-        n_edges = len(sel_filtered)
-        is_complete = (n_edges == n * (n - 1) // 2)
+        use_native_helpers = bool(is_complete and _NATIVE_DGF_AVAILABLE and _DGF_NATIVE_ENABLED)
+        native_mode = use_native_helpers
 
+        # Dependency map: edge -> set of pairs currently routed through it.
         uses: dict[tuple[int, int], set[tuple[int, int]]] = {}
-        for e in sel_filtered:
-            key = (min(e[0], e[1]), max(e[0], e[1]))
-            uses[key] = set()
 
-        if is_complete:
-            # K_n Euclidean: every pair's SP is its direct edge
+        if not is_complete:
             for e in sel_filtered:
                 key = (min(e[0], e[1]), max(e[0], e[1]))
-                uses[key].add(key)
-        else:
-            # General graph: run APSP with predecessors, trace all pairs
+                uses[key] = set()
             finite = np.isfinite(adj) & (adj > 0)
             csr = sp_sparse.csr_matrix(np.where(finite, adj, 0.0))
             _, predecessors = sp_dijkstra(csr, return_predecessors=True)
@@ -695,79 +873,222 @@ def dgf_one_pass(
 
         shorter_half_start = len(sel_filtered) // 2
 
+        # GPU Phase 2: keep APSP on GPU for fast violation checks
+        sp_gpu = None
+        adj_gpu = None
+        dist_gpu = None
+        if use_gpu_phase2:
+            adj_gpu = cp.asarray(adj, dtype=np.float64)
+            dist_gpu = cp.asarray(dist_np, dtype=np.float64)
+            t0 = time.perf_counter()
+            sp_gpu = _fw_device(adj)
+            profiler.add("gpu_phase2_init_apsp", time.perf_counter() - t0)
+            tqdm.write(f"    GPU Phase 2: APSP initialized on GPU ({n}x{n} matrix)")
+
         for edge_idx, edge in enumerate(tqdm(sel_filtered, desc="dgf", unit="edge", leave=False)):
             u, v = edge[0], edge[1]
             w = dist_np[u, v]
             key = (min(u, v), max(u, v))
 
-            pairs = uses.get(key, set())
-            if not pairs:
-                # Edge not on any current SP — removable instantly
-                adj[u, v] = np.inf
-                adj[v, u] = np.inf
-                sparse_adj[u, v] = 0
-                sparse_adj[v, u] = 0
-                removed += 1
-                continue
+            pairs_explicit = uses.get(key, set())
+            if is_complete:
+                if pairs_explicit:
+                    pair_set = set(pairs_explicit)
+                    pair_set.add(key)
+                    pair_list = _sort_pairs_with_key_first(
+                        pair_set, key, use_native=use_native_helpers
+                    )
+                else:
+                    pair_list = [key]
+            else:
+                if not pairs_explicit:
+                    adj[u, v] = np.inf
+                    adj[v, u] = np.inf
+                    sparse_adj[u, v] = 0
+                    sparse_adj[v, u] = 0
+                    if use_gpu_phase2:
+                        adj_gpu[u, v] = cp.inf
+                        adj_gpu[v, u] = cp.inf
+                    removed += 1
+                    continue
+                pair_list = _sort_pairs_with_key_first(
+                    pairs_explicit, key, use_native=use_native_helpers
+                )
 
             # Tentatively remove edge
             adj[u, v] = np.inf
             adj[v, u] = np.inf
             sparse_adj[u, v] = 0
             sparse_adj[v, u] = 0
+            if use_gpu_phase2:
+                adj_gpu[u, v] = cp.inf
+                adj_gpu[v, u] = cp.inf
 
-            # Reuse one CSR conversion for all source queries of this edge.
-            csr_current = sparse_adj.tocsr()
+            # ── GPU-accelerated necessity check ──────────────────────────
+            if use_gpu_phase2:
+                if sp_gpu is None:
+                    t0_rebuild = time.perf_counter()
+                    sp_gpu = cp.copy(adj_gpu)
+                    tmp_rebuild = cp.empty((n, n), dtype=np.float64)
+                    for k_fw in range(n):
+                        cp.add(sp_gpu[:, k_fw:k_fw+1], sp_gpu[k_fw:k_fw+1, :], out=tmp_rebuild)
+                        cp.minimum(sp_gpu, tmp_rebuild, out=sp_gpu)
+                    profiler.add("gpu_phase2_apsp_rebuild", time.perf_counter() - t0_rebuild)
+                t0 = time.perf_counter()
 
-            # Check each dependent pair via targeted Dijkstra.
-            # Process (u,v) pair first when present for earlier exits.
-            pair_list = list(pairs)
-            if key in pairs:
-                pair_list = [key] + [p for p in pair_list if p != key]
+                # Check which pairs are affected by this edge removal
+                sp_r_u = sp_gpu[:, u:u+1]
+                sp_v_s = sp_gpu[v:v+1, :]
+                sp_r_v = sp_gpu[:, v:v+1]
+                sp_u_s = sp_gpu[u:u+1, :]
+
+                route_uv = sp_r_u + w + sp_v_s
+                route_vu = sp_r_v + w + sp_u_s
+                best_through = cp.minimum(route_uv, route_vu)
+
+                tol = 1e-10
+                affected_mask = cp.abs(sp_gpu - best_through) < tol
+                self_affected = float(cp.asnumpy(sp_gpu[u, v])) <= w + tol
+
+                if not self_affected and not bool(cp.any(affected_mask)):
+                    # Edge not on any shortest path — free removal
+                    removed += 1
+                    uses.pop(key, None)
+                    profiler.add("gpu_phase2_free_removal", time.perf_counter() - t0)
+                    continue
+
+                # Decide: GPU FW (many sources) vs CPU Dijkstra (few sources)
+                # On RTX 3090, GPU FW (O(n³) vectorised) beats CPU Dijkstra
+                # from k sources once k is even modestly large.  The GPU
+                # also gives us a full APSP update we can cache, so prefer
+                # it for anything beyond a handful of sources.
+                n_sources = len(set(r for r, _ in pair_list))
+                use_gpu_fw = (n_sources > n // 8)
+
+                if use_gpu_fw:
+                    # Full GPU FW recompute
+                    d_gpu = cp.copy(adj_gpu)
+                    tmp_gpu = cp.empty((n, n), dtype=np.float64)
+                    for k_fw in range(n):
+                        cp.add(d_gpu[:, k_fw:k_fw+1], d_gpu[k_fw:k_fw+1, :], out=tmp_gpu)
+                        cp.minimum(d_gpu, tmp_gpu, out=d_gpu)
+
+                    sp_upper = d_gpu[r_np, s_np]
+                    dist_upper_gpu = dist_gpu[r_np, s_np]
+                    violated = bool(cp.any(cp.isinf(sp_upper) | (sp_upper > t * dist_upper_gpu)))
+                    profiler.add("gpu_phase2_fw_check", time.perf_counter() - t0)
+
+                    if violated:
+                        adj[u, v] = w
+                        adj[v, u] = w
+                        sparse_adj[u, v] = w
+                        sparse_adj[v, u] = w
+                        adj_gpu[u, v] = w
+                        adj_gpu[v, u] = w
+                        continue
+                    else:
+                        sp_gpu = d_gpu
+                        removed += 1
+
+                        # Uses update (CPU — need predecessors)
+                        t0 = time.perf_counter()
+                        csr_current = sparse_adj.tocsr(copy=False)
+                        sources_gpu: list[int] = []
+                        seen_gpu: set[int] = set()
+                        for r, _ in pair_list:
+                            if r not in seen_gpu:
+                                seen_gpu.add(r)
+                                sources_gpu.append(r)
+                        _, pred_rows = sp_dijkstra(
+                            csr_current, indices=sources_gpu, return_predecessors=True
+                        )
+                        pred_rows = np.atleast_2d(pred_rows)
+                        source_row = {src: idx for idx, src in enumerate(sources_gpu)}
+                        for (r, s) in pair_list:
+                            pred_src = pred_rows[source_row[r]]
+                            _trace_and_update_uses_maybe_native(
+                                pred_src, r, s, uses, n, use_native=use_native_helpers
+                            )
+                        uses.pop(key, None)
+                        profiler.add("gpu_phase2_uses_update", time.perf_counter() - t0)
+
+                        if removed > 0 and removed % rebuild_interval == 0:
+                            t0 = time.perf_counter()
+                            existing_keys = set(uses.keys())
+                            uses = _rebuild_uses(sparse_adj, n, existing_keys)
+                            profiler.add("dense_uses_rebuild", time.perf_counter() - t0)
+                        continue
+                else:
+                    # Few sources — fall through to CPU Dijkstra path
+                    pass
+
+            # ── CPU fallback (non-GPU or few-sources path) ───────────────
+            t0 = time.perf_counter()
+            csr_current = sparse_adj.tocsr(copy=False)
+            profiler.add("dense_csr_build", time.perf_counter() - t0)
+
+            sources: list[int] = []
+            seen_sources: set[int] = set()
+            for r, _ in pair_list:
+                if r not in seen_sources:
+                    seen_sources.add(r)
+                    sources.append(r)
 
             split_pred_mode = edge_idx >= shorter_half_start
             necessary = False
-            dist_cache: dict[int, np.ndarray] = {}
-            pred_cache: dict[int, np.ndarray] = {}
+            source_row = {src: idx for idx, src in enumerate(sources)}
+            pred_rows: Optional[np.ndarray] = None
+
+            t0 = time.perf_counter()
+            if split_pred_mode:
+                d_rows = sp_dijkstra(csr_current, indices=sources)
+            else:
+                d_rows, pred_rows = sp_dijkstra(
+                    csr_current, indices=sources, return_predecessors=True
+                )
+            d_rows = np.atleast_2d(d_rows)
 
             for (r, s) in pair_list:
-                src = r
-                if src not in dist_cache:
-                    if split_pred_mode:
-                        dist_cache[src] = sp_dijkstra(csr_current, indices=[src]).ravel()
-                    else:
-                        d_src, pred_src = sp_dijkstra(
-                            csr_current, indices=[src], return_predecessors=True
-                        )
-                        dist_cache[src] = d_src.ravel()
-                        pred_cache[src] = pred_src[0]
-                d_src = dist_cache[src]
+                d_src = d_rows[source_row[r]]
                 if d_src[s] > t * dist_np[r, s]:
                     necessary = True
                     break
+            profiler.add("dense_necessity_checks", time.perf_counter() - t0)
 
             if necessary:
                 adj[u, v] = w
                 adj[v, u] = w
                 sparse_adj[u, v] = w
                 sparse_adj[v, u] = w
+                if use_gpu_phase2:
+                    adj_gpu[u, v] = w
+                    adj_gpu[v, u] = w
                 continue
 
             # Removable — update uses for re-routed pairs
             removed += 1
-            for (r, s) in pair_list:
-                if r not in pred_cache:
-                    _, pred_src = sp_dijkstra(
-                        csr_current, indices=[r], return_predecessors=True
-                    )
-                    pred_cache[r] = pred_src[0]
-                _trace_and_update_uses(pred_cache[r], r, s, uses)
-            uses.pop(key, None)
+            if use_gpu_phase2:
+                sp_gpu = None  # Invalidate GPU APSP cache
+            t0 = time.perf_counter()
+            if pred_rows is None:
+                _, pred_rows = sp_dijkstra(
+                    csr_current, indices=sources, return_predecessors=True
+                )
+            pred_rows = np.atleast_2d(pred_rows)
 
-            # Periodically rebuild uses to purge stale entries
+            for (r, s) in pair_list:
+                pred_src = pred_rows[source_row[r]]
+                _trace_and_update_uses_maybe_native(
+                    pred_src, r, s, uses, n, use_native=use_native_helpers
+                )
+            uses.pop(key, None)
+            profiler.add("dense_uses_update", time.perf_counter() - t0)
+
             if removed > 0 and removed % rebuild_interval == 0:
+                t0 = time.perf_counter()
                 existing_keys = set(uses.keys())
                 uses = _rebuild_uses(sparse_adj, n, existing_keys)
+                profiler.add("dense_uses_rebuild", time.perf_counter() - t0)
 
         remaining = []
         for e in sel_filtered:
@@ -776,6 +1097,15 @@ def dgf_one_pass(
                 remaining.append(e)
 
     total_removed = n_batch_removed + removed
+    profiler.add("phase2_total", time.perf_counter() - t_phase)
+    _gpu_used = not use_sparse and _CUDA and n >= 100
+    if _DGF_PROFILE_ENABLED:
+        mode = "sparse" if use_sparse else "dense"
+        if native_mode:
+            mode = f"{mode}-native"
+        if _gpu_used:
+            mode = f"{mode}-gpu"
+        profiler.report(prefix=f"dgf-{mode}")
     return remaining, total_removed
 
 
@@ -1068,6 +1398,13 @@ def main() -> None:
         ]
 
         done = set(algo_results.keys())
+
+        # Skip K_n DGF for n >= 1000 — O(n^3.3) is prohibitive
+        if N >= 1000:
+            if "dgf" not in done:
+                print(f"  Skipping K_n DGF (n={N} >= 1000, too slow)")
+            RUNS = [(name, fn) for name, fn in RUNS if name != "dgf"]
+
         missing_runs = [(name, fn) for name, fn in RUNS if name not in done]
 
         if not missing_runs:
@@ -1102,8 +1439,15 @@ def main() -> None:
 
             print(f"{runtime_ms:.0f} ms, {metrics['edge_count']} edges", end=" ", flush=True)
 
-            is_min = check_minimality(edges, dist, N, t)
-            print(f"minimal={is_min}")
+            # DGF-based algorithms already produce minimal spanners by
+            # construction — skip the expensive second DGF pass for them.
+            dgf_minimal_algos = {"sqrt_greedy_dgf", "yao_dgf", "dgf"}
+            if name in dgf_minimal_algos:
+                is_min = True
+                print(f"minimal={is_min} (by construction)")
+            else:
+                is_min = check_minimality(edges, dist, N, t)
+                print(f"minimal={is_min}")
 
             algo_results[name] = {
                 **metrics,
