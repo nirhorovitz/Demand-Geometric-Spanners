@@ -381,7 +381,7 @@ def run(
     if n <= 1:
         return np.empty((0, 2), dtype=np.int64)
 
-    candidates = resolve_candidates(points, None)
+    candidates = resolve_candidates(points, E_input)
     w = resolve_weight(weight, n)
     dist = _euclidean_distances(points)
 
