@@ -406,6 +406,29 @@ def _dijkstra_one(adj, src: int, n: int) -> np.ndarray:
     return sp_dijkstra(csr, indices=[src]).ravel()
 
 
+def _dijkstra_with_pred(adj_np: np.ndarray, src: int) -> tuple[np.ndarray, np.ndarray]:
+    """Dijkstra from src returning (distances, predecessors). Dense adj input."""
+    finite = np.isfinite(adj_np) & (adj_np > 0)
+    csr = sp_sparse.csr_matrix(np.where(finite, adj_np, 0.0))
+    d, pred = sp_dijkstra(csr, indices=[src], return_predecessors=True)
+    return d.ravel(), pred[0]
+
+
+def _trace_and_update_uses(pred: np.ndarray, r: int, s: int, uses: dict) -> None:
+    """Trace SP from r to s via predecessor array. Add (r,s) to uses for each edge on path."""
+    pair = (min(r, s), max(r, s))
+    cur = s
+    while cur != r and cur >= 0:
+        prev = int(pred[cur])
+        if prev < 0:
+            break
+        edge_key = (min(prev, cur), max(prev, cur))
+        if edge_key not in uses:
+            uses[edge_key] = set()
+        uses[edge_key].add(pair)
+        cur = prev
+
+
 # ── Yao graph ─────────────────────────────────────────────────────────────────
 
 def yao_k_for_t(t: float) -> int:
@@ -599,37 +622,93 @@ def dgf_one_pass(
             if lil[u, v] != 0:
                 remaining.append(e)
     else:
-        # ── Dense path: GPU/CPU FW (unchanged) ──────────────────────────
-        r_dev, s_dev = xp.asarray(r_np), xp.asarray(s_np)
-        dist_upper_dev = xp.asarray(dist_np)[r_dev, s_dev]
-
-        def _violation_dev(sp_dev):
-            sp_up = sp_dev[r_dev, s_dev]
-            v = xp.any(xp.isinf(sp_up) | (sp_up > t * dist_upper_dev))
-            return bool(v.get() if _CUDA else v)
-
+        # ── Dense path: edge-dependency tracking ─────────────────────────
         adj = _build_adj_np(sel_filtered, n, dist_np)
         removed = 0
+
+        # Initialize uses via APSP with predecessor tracking.
+        # For K_n (complete graph), this reduces to uses[(u,v)] = {(u,v)}
+        # since direct edges are always shortest (triangle inequality).
+        # For non-complete inputs (e.g. greedy output), pairs without
+        # direct edges route through multi-hop paths that must be tracked.
+        n_edges = len(sel_filtered)
+        is_complete = (n_edges == n * (n - 1) // 2)
+
+        uses: dict[tuple[int, int], set[tuple[int, int]]] = {}
+        for e in sel_filtered:
+            key = (min(e[0], e[1]), max(e[0], e[1]))
+            uses[key] = set()
+
+        if is_complete:
+            # K_n Euclidean: every pair's SP is its direct edge
+            for e in sel_filtered:
+                key = (min(e[0], e[1]), max(e[0], e[1]))
+                uses[key].add(key)
+        else:
+            # General graph: run APSP with predecessors, trace all pairs
+            finite = np.isfinite(adj) & (adj > 0)
+            csr = sp_sparse.csr_matrix(np.where(finite, adj, 0.0))
+            _, predecessors = sp_dijkstra(csr, return_predecessors=True)
+            for r in range(n):
+                for s in range(r + 1, n):
+                    pair = (r, s)
+                    cur = s
+                    while cur != r and cur >= 0:
+                        prev = int(predecessors[r, cur])
+                        if prev < 0:
+                            break
+                        edge_key = (min(prev, cur), max(prev, cur))
+                        if edge_key in uses:
+                            uses[edge_key].add(pair)
+                        cur = prev
 
         for edge in tqdm(sel_filtered, desc="dgf", unit="edge", leave=False):
             u, v = edge[0], edge[1]
             w = dist_np[u, v]
+            key = (min(u, v), max(u, v))
 
+            pairs = uses.get(key, set())
+            if not pairs:
+                # Edge not on any current SP — removable instantly
+                adj[u, v] = np.inf
+                adj[v, u] = np.inf
+                removed += 1
+                continue
+
+            # Tentatively remove edge
             adj[u, v] = np.inf
             adj[v, u] = np.inf
 
-            d_from_u = _dijkstra_one(adj, u, n)
-            if d_from_u[v] > t * w:
+            # Check each dependent pair via targeted Dijkstra
+            necessary = False
+            dijkstra_cache: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+
+            for (r, s) in pairs:
+                src = r
+                if src not in dijkstra_cache:
+                    dijkstra_cache[src] = _dijkstra_with_pred(adj, src)
+                d_src = dijkstra_cache[src][0]
+                if d_src[s] > t * dist_np[r, s]:
+                    necessary = True
+                    break
+
+            if necessary:
                 adj[u, v] = w
                 adj[v, u] = w
                 continue
 
-            sp_new = _fw_device(adj)
-            if _violation_dev(sp_new):
-                adj[u, v] = w
-                adj[v, u] = w
-            else:
-                removed += 1
+            # Removable — update uses for re-routed pairs
+            removed += 1
+            for (r, s) in pairs:
+                if r in dijkstra_cache:
+                    pred = dijkstra_cache[r][1]
+                    _trace_and_update_uses(pred, r, s, uses)
+                elif s in dijkstra_cache:
+                    pred = dijkstra_cache[s][1]
+                    _trace_and_update_uses(pred, s, r, uses)
+                # else: pair was checked via a shared source — its route
+                # will be stale in uses but that's harmless (extra checks)
+            uses.pop(key, None)
 
         remaining = []
         for e in sel_filtered:
