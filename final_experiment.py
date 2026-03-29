@@ -1400,10 +1400,10 @@ def main() -> None:
         done = set(algo_results.keys())
 
         # Skip K_n DGF for n >= 1000 — O(n^3.3) is prohibitive
-        if N >= 1000:
-            if "dgf" not in done:
-                print(f"  Skipping K_n DGF (n={N} >= 1000, too slow)")
-            RUNS = [(name, fn) for name, fn in RUNS if name != "dgf"]
+        # if N >= 1000:
+        #     if "dgf" not in done:
+        #         print(f"  Skipping K_n DGF (n={N} >= 1000, too slow)")
+        #     RUNS = [(name, fn) for name, fn in RUNS if name != "dgf"]
 
         missing_runs = [(name, fn) for name, fn in RUNS if name not in done]
 
