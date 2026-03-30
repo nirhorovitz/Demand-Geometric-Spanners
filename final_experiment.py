@@ -726,19 +726,13 @@ def dgf_one_pass(
 
     sel = sorted(edges, key=lambda e: -dist_np[e[0], e[1]])
 
-    if _NATIVE_DGF_AVAILABLE and _DGF_NATIVE_ENABLED:
+    use_sparse = len(sel) < 4 * n
+
+    if _NATIVE_DGF_AVAILABLE and _DGF_NATIVE_ENABLED and not use_sparse:
         try:
             return native_dgf_one_pass(sel, dist_np, n, t)
         except Exception as e:
             print(f"    [Native DGF failed: {e}, falling back to Python]")
-
-    xp = cp if _CUDA else np
-    profiler = _DgfProfiler(_DGF_PROFILE_ENABLED)
-    t_phase = time.perf_counter()
-    native_mode = False
-
-    # Dual-mode: sparse Dijkstra for small edge sets, dense FW for large ones
-    use_sparse = len(sel) < 4 * n
 
     # ── Phase 1: batch pre-filter (one APSP call) ────────────────────────
     n_edges = len(sel)
