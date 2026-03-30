@@ -1399,11 +1399,11 @@ def main() -> None:
 
         done = set(algo_results.keys())
 
-        # Skip K_n DGF for n >= 1000 — O(n^3.3) is prohibitive
-        # if N >= 1000:
-        #     if "dgf" not in done:
-        #         print(f"  Skipping K_n DGF (n={N} >= 1000, too slow)")
-        #     RUNS = [(name, fn) for name, fn in RUNS if name != "dgf"]
+        # Skip K_n DGF for n >= 1000 — O(n^3.3) is prohibitive (unless forced)
+        if N >= 1000 and not FORCE_DGF:
+            if "dgf" not in done:
+                print(f"  Skipping K_n DGF (n={N} >= 1000, too slow)")
+            RUNS = [(name, fn) for name, fn in RUNS if name != "dgf"]
 
         missing_runs = [(name, fn) for name, fn in RUNS if name not in done]
 
@@ -1473,6 +1473,8 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Yao-graph spanner experiment")
     parser.add_argument("--n", type=int, default=N, help="Number of random points (default: 5000)")
+    parser.add_argument("--force-dgf", action="store_true", help="Force run DGF algorithms even for large n")
     args = parser.parse_args()
     N = args.n
+    FORCE_DGF = args.force_dgf
     main()
