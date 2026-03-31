@@ -154,8 +154,32 @@ def _get_n_workers() -> int:
 
 
 def _parallel_apsp(csr: sp_sparse.csr_matrix, n: int, stats: dict | None = None) -> np.ndarray:
-    """Multi-threaded APSP. scipy Dijkstra releases GIL."""
+    """Multi-threaded APSP. GPU FW for moderate n, else parallel CPU Dijkstra."""
     nw = _get_n_workers()
+
+    # GPU Floyd-Warshall: n<=6000 fits comfortably in VRAM (6000²×8 ≈ 288MB)
+    if _CUDA and n <= 6000:
+        t0 = time.perf_counter()
+        # Convert CSR to dense adjacency
+        adj = np.full((n, n), np.inf, dtype=np.float64)
+        np.fill_diagonal(adj, 0.0)
+        rows, cols = csr.nonzero()
+        adj[rows, cols] = np.array(csr[rows, cols]).ravel()
+        # GPU FW
+        d = cp.asarray(adj)
+        tmp = cp.empty((n, n), dtype=np.float64)
+        for k in range(n):
+            cp.add(d[:, k:k+1], d[k:k+1, :], out=tmp)
+            cp.minimum(d, tmp, out=d)
+        result = cp.asnumpy(d)
+        elapsed = time.perf_counter() - t0
+        if stats is not None:
+            stats["apsp_calls"] = stats.get("apsp_calls", 0) + 1
+            stats["apsp_total_s"] = stats.get("apsp_total_s", 0.0) + elapsed
+            stats["apsp_last_s"] = elapsed
+            stats["apsp_method"] = "gpu_fw"
+            stats["apsp_workers"] = 1
+        return result
 
     if n < 200 or nw <= 1:
         t0 = time.perf_counter()
@@ -169,7 +193,7 @@ def _parallel_apsp(csr: sp_sparse.csr_matrix, n: int, stats: dict | None = None)
             stats["apsp_workers"] = 1
         return result
 
-    chunk_size = (n + nw - 1) // nw
+    chunk_size = min(64, (n + nw - 1) // nw)  # small chunks for dynamic load balancing
     chunks = [list(range(i, min(i + chunk_size, n))) for i in range(0, n, chunk_size)]
 
     chunk_times: list[float] = []
