@@ -734,6 +734,11 @@ def dgf_one_pass(
         except Exception as e:
             print(f"    [Native DGF failed: {e}, falling back to Python]")
 
+    xp = cp if _CUDA else np
+    profiler = _DgfProfiler(_DGF_PROFILE_ENABLED)
+    t_phase = time.perf_counter()
+    native_mode = False
+
     # ── Phase 1: batch pre-filter (one APSP call) ────────────────────────
     n_edges = len(sel)
     is_complete = (n_edges == n * (n - 1) // 2)
