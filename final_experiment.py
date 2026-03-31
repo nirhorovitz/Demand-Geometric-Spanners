@@ -1163,8 +1163,13 @@ def _greedy_local(points: np.ndarray, t: float, E_input=None) -> np.ndarray:
 
     selected = []
     sp = None  # APSP on device, initialised on first edge
+    total_candidates = len(candidates)
 
-    for idx in tqdm(range(len(candidates)), desc="greedy", unit="edge", leave=False):
+    for idx in tqdm(range(total_candidates), desc="greedy", unit="edge", leave=False):
+        # Print progress for the last 4000 edges so we can see it isn't hanging
+        if total_candidates - idx <= 4000:
+            print(f"      [Greedy Phase] Processing edge {idx} / {total_candidates} ({(idx/total_candidates)*100:.1f}%)")
+
         i, j = int(candidates[idx, 0]), int(candidates[idx, 1])
         w = float(dist_np[i, j])
 
@@ -1191,6 +1196,7 @@ def _greedy_local(points: np.ndarray, t: float, E_input=None) -> np.ndarray:
             )
             xp.minimum(sp, cand, out=sp)
 
+    print("      [Greedy Phase] Loop finished. Returning selected edges.")
     return np.array(selected, dtype=np.int64) if selected else np.empty((0, 2), dtype=np.int64)
 
 
@@ -1426,23 +1432,27 @@ def main() -> None:
             edges = fn()
             runtime_ms = (time.perf_counter() - t0) * 1000.0
 
+            print(f"      [{name}] fn() returned. Computing metrics...", flush=True)
+
             metrics = compute_metrics(
                 edges, P, None, t, runtime_ms,
                 skip_full_stretch_above_n=10_000_000,
             )
 
-            print(f"{runtime_ms:.0f} ms, {metrics['edge_count']} edges", end=" ", flush=True)
+            print(f"      [{name}] Metrics computed. {runtime_ms:.0f} ms, {metrics['edge_count']} edges", flush=True)
 
             # DGF-based algorithms already produce minimal spanners by
             # construction — skip the expensive second DGF pass for them.
             dgf_minimal_algos = {"sqrt_greedy_dgf", "yao_dgf", "dgf"}
             if name in dgf_minimal_algos:
                 is_min = True
-                print(f"minimal={is_min} (by construction)")
+                print(f"      [{name}] minimal={is_min} (by construction)")
             else:
+                print(f"      [{name}] Checking minimality...", flush=True)
                 is_min = check_minimality(edges, dist, N, t)
-                print(f"minimal={is_min}")
+                print(f"      [{name}] minimal={is_min}")
 
+            print(f"      [{name}] Saving results to disk...", flush=True)
             algo_results[name] = {
                 **metrics,
                 "is_minimal": is_min,
@@ -1451,6 +1461,7 @@ def main() -> None:
 
             # Save after every algorithm so an interruption loses at most one result
             _save_results(out, algo_results)
+            print(f"      [{name}] Save complete.", flush=True)
 
         _print_table(algo_results, t)
         _plot_table(out, P, algo_results, t)
