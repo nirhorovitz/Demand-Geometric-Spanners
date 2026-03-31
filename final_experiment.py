@@ -204,6 +204,7 @@ from core.metrics import (
     compute_metrics,
 )
 from core.mst import mst_weight
+from faster_dgf import faster_dgf_one_pass
 
 # ── Plotting constants ────────────────────────────────────────────────────────
 NA_STR = "N/A"
@@ -1141,10 +1142,7 @@ def check_minimality(
     print(f"        [check_minimality] Starting check for {len(sel)} edges (n={n}, t={t})", flush=True)
 
     # ── Quick bale-out check: start from the longest edges and only use fast Dijkstra ──
-    for i_edge, edge in enumerate(sel):
-        if i_edge % 100 == 0:
-            print(f"        [check_minimality] Progress: checked {i_edge}/{len(sel)} edges...", flush=True)
-            
+    for edge in sel:            
         u, v = edge[0], edge[1]
         w = dist[u, v]
         
@@ -1224,9 +1222,6 @@ def _greedy_local(points: np.ndarray, t: float, E_input=None) -> np.ndarray:
 
     for idx in tqdm(range(total_candidates), desc="greedy", unit="edge", leave=False):
         # Print progress for the last 4000 edges so we can see it isn't hanging
-        if total_candidates - idx <= 4000:
-            print(f"      [Greedy Phase] Processing edge {idx} / {total_candidates} ({(idx/total_candidates)*100:.1f}%)")
-
         i, j = int(candidates[idx, 0]), int(candidates[idx, 1])
         w = float(dist_np[i, j])
 
@@ -1269,7 +1264,7 @@ def algo_dgf(points: np.ndarray, t: float, dist: np.ndarray) -> np.ndarray:
     """Algorithm 2: DGF on the complete graph (all n(n-1)/2 pairs)."""
     n = points.shape[0]
     all_pairs = [(i, j) for i in range(n) for j in range(i + 1, n)]
-    result, _ = dgf_one_pass(all_pairs, dist, n, t)
+    result, _ = faster_dgf_one_pass(all_pairs, dist, n, t)
     return np.array(result, dtype=np.int64) if result else np.empty((0, 2), dtype=np.int64)
 
 
@@ -1283,7 +1278,7 @@ def algo_sqrt_greedy_dgf(points: np.ndarray, t: float, dist: np.ndarray) -> np.n
     stage1 = _greedy_local(points, math.sqrt(t))
     edge_list = [(int(e[0]), int(e[1])) for e in stage1]
     n = points.shape[0]
-    result, _ = dgf_one_pass(edge_list, dist, n, t)
+    result, _ = faster_dgf_one_pass(edge_list, dist, n, t)
     return np.array(result, dtype=np.int64) if result else np.empty((0, 2), dtype=np.int64)
 
 
@@ -1295,7 +1290,7 @@ def algo_yao_dgf(
 ) -> np.ndarray:
     """Algorithm 5: t-Yao -> DGF(t). Reuses precomputed yao_t_edges."""
     edge_list = [(int(e[0]), int(e[1])) for e in yao_t_edges]
-    result, _ = dgf_one_pass(edge_list, dist, n, t)
+    result, _ = faster_dgf_one_pass(edge_list, dist, n, t)
     return np.array(result, dtype=np.int64) if result else np.empty((0, 2), dtype=np.int64)
 
 
