@@ -1117,14 +1117,66 @@ def check_minimality(
     t: float,
 ) -> bool:
     """
-    E is minimal iff dgf_one_pass(E) removes 0 edges.
-    (Every edge in E is necessary: removing it breaks some pair's t-path.)
+    Check if E is minimal by testing if ANY edge can be removed while 
+    maintaining the t-spanner property. Quick bale out on first removable edge.
     """
     if len(edges) == 0:
         return True
+    
+    from scipy.sparse import dok_matrix
+    from scipy.sparse.csgraph import shortest_path
+
+    # Build sparse adjacency
+    lil = dok_matrix((n, n), dtype=np.float64)
+    for e in edges:
+        u, v = int(e[0]), int(e[1])
+        w = dist[u, v]
+        lil[u, v] = w
+        lil[v, u] = w
+    
+    # Sort edges descending by length (same as DGF)
     edge_list = [(int(e[0]), int(e[1])) for e in edges]
-    _, removed = dgf_one_pass(edge_list, dist, n, t)
-    return removed == 0
+    sel = sorted(edge_list, key=lambda e: -dist[e[0], e[1]])
+    
+    print(f"        [check_minimality] Starting check for {len(sel)} edges (n={n}, t={t})", flush=True)
+
+    # ── Quick bale-out check: start from the longest edges and only use fast Dijkstra ──
+    for i_edge, edge in enumerate(sel):
+        if i_edge % 100 == 0:
+            print(f"        [check_minimality] Progress: checked {i_edge}/{len(sel)} edges...", flush=True)
+            
+        u, v = edge[0], edge[1]
+        w = dist[u, v]
+        
+        # Tentatively remove edge
+        lil[u, v] = 0
+        lil[v, u] = 0
+        
+        # Check if still valid t-spanner using FAST single-source Dijkstra
+        from scipy.sparse.csgraph import dijkstra
+        d_from_u = dijkstra(lil.tocsr(), indices=[u]).ravel()
+        
+        # If distance from u to v is still <= t * w, this edge wasn't even strictly necessary for its own endpoints!
+        if d_from_u[v] <= (t * w) + 1e-6:
+            # Full APSP check just to be absolutely sure no other pairs were broken
+            r_np, s_np = np.triu_indices(n, k=1)
+            dist_upper_np = dist[r_np, s_np]
+            sp_new = shortest_path(lil.tocsr(), directed=False)
+            sp_up = sp_new[r_np, s_np]
+            
+            dist_up_t = (dist_upper_np * t) + 1e-6
+            violated = bool(np.any(np.isinf(sp_up) | (sp_up > dist_up_t)))
+            
+            if not violated:
+                print(f"        [check_minimality] Edge {edge} is removable! Returning False.")
+                return False
+            
+        # Put edge back
+        lil[u, v] = w
+        lil[v, u] = w
+
+    # No edges could be removed
+    return True
 
 
 # ── GPU-aware greedy ──────────────────────────────────────────────────────────
