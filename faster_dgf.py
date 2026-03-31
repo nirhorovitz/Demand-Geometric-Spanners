@@ -1,8 +1,8 @@
 """
-Faster DGF (Descending Greedy Filter) v4
+Faster DGF (Descending Greedy Filter) v5
 =========================================
-Uses-tracking approach: 1 APSP to build dependency map, then per-edge
-targeted Dijkstra on affected source nodes only.
+Per-edge GPU APSP approach: for each candidate edge, do a quick Dijkstra
+precheck, then full GPU Floyd-Warshall APSP + violation check.
 
 Interface:
     faster_dgf_one_pass(edges, dist_np, n, t) -> (remaining_edges, n_removed)
@@ -84,11 +84,11 @@ def _csr_find(csr: sp_sparse.csr_matrix, row: int, col: int) -> int:
 
 
 def _csr_remove(csr: sp_sparse.csr_matrix, u: int, v: int) -> None:
-    """Zero out (u,v) and (v,u). O(log degree)."""
+    """Set (u,v) and (v,u) to inf (Dijkstra ignores inf-weight edges). O(log degree)."""
     for a, b in [(u, v), (v, u)]:
         idx = _csr_find(csr, a, b)
         if idx >= 0:
-            csr.data[idx] = 0.0
+            csr.data[idx] = np.inf
 
 
 def _csr_restore(csr: sp_sparse.csr_matrix, u: int, v: int, w: float) -> None:
@@ -99,65 +99,17 @@ def _csr_restore(csr: sp_sparse.csr_matrix, u: int, v: int, w: float) -> None:
             csr.data[idx] = w
 
 
-def _clean(csr: sp_sparse.csr_matrix) -> sp_sparse.csr_matrix:
-    """Copy + eliminate zeros so sp_dijkstra sees removed edges as absent."""
-    c = csr.copy()
-    c.eliminate_zeros()
-    return c
+# ── Violation check ──────────────────────────────────────────────────────────
 
-
-# ── Uses (dependency tracking) ───────────────────────────────────────────────
-
-def _build_uses(csr: sp_sparse.csr_matrix, n: int, edge_keys: set) -> dict:
-    """Build uses: edge -> set of pairs whose SP uses that edge."""
-    _, pred = sp_dijkstra(csr, return_predecessors=True, directed=False)
-    uses: dict[tuple[int, int], set[tuple[int, int]]] = {}
-    for key in edge_keys:
-        uses[key] = set()
-    for r in range(n):
-        for s in range(r + 1, n):
-            pair = (r, s)
-            cur = s
-            while cur != r and cur >= 0:
-                prev = int(pred[r, cur])
-                if prev < 0:
-                    break
-                ek = (min(prev, cur), max(prev, cur))
-                if ek in uses:
-                    uses[ek].add(pair)
-                cur = prev
-    return uses
-
-
-def _update_uses(
-    csr: sp_sparse.csr_matrix,
-    pair_list: list[tuple[int, int]],
-    uses: dict,
-) -> None:
-    """Re-trace paths for affected pairs after a removal."""
-    sources: list[int] = []
-    seen: set[int] = set()
-    for r, _ in pair_list:
-        if r not in seen:
-            seen.add(r)
-            sources.append(r)
-
-    _, pred_rows = sp_dijkstra(csr, indices=sources, return_predecessors=True, directed=False)
-    pred_rows = np.atleast_2d(pred_rows)
-    smap = {src: idx for idx, src in enumerate(sources)}
-
-    for (r, s) in pair_list:
-        pair = (min(r, s), max(r, s))
-        pred = pred_rows[smap[r]]
-        cur = s
-        while cur != r and cur >= 0:
-            prev = int(pred[cur])
-            if prev < 0:
-                break
-            ek = (min(prev, cur), max(prev, cur))
-            if ek in uses:
-                uses[ek].add(pair)
-            cur = prev
+def _any_violation(sp_matrix: np.ndarray, dist_np: np.ndarray, t: float, n: int) -> bool:
+    """Check if any pair (i,j) has sp[i,j] > t * dist[i,j]. GPU-accelerated if available."""
+    if _CUDA:
+        sp_gpu = cp.asarray(sp_matrix)
+        dist_gpu = cp.asarray(dist_np[:n, :n])
+        violated = cp.any(sp_gpu > t * dist_gpu + 1e-9)
+        return bool(violated)
+    else:
+        return bool(np.any(sp_matrix > t * dist_np[:n, :n] + 1e-9))
 
 
 # ── Parallel APSP ────────────────────────────────────────────────────────────
@@ -180,7 +132,11 @@ def _parallel_apsp(csr: sp_sparse.csr_matrix, n: int, stats: dict | None = None)
         adj = np.full((n, n), np.inf, dtype=np.float64)
         np.fill_diagonal(adj, 0.0)
         rows, cols = csr.nonzero()
-        adj[rows, cols] = np.array(csr[rows, cols]).ravel()
+        vals = np.array(csr[rows, cols]).ravel()
+        # Only copy finite values (inf entries stay as inf in adj)
+        finite_mask = np.isfinite(vals)
+        if np.any(finite_mask):
+            adj[rows[finite_mask], cols[finite_mask]] = vals[finite_mask]
         # GPU FW via RawKernel
         d = cp.asarray(adj)
         threads = 256
@@ -254,8 +210,7 @@ def faster_dgf_one_pass(
     """
     Descending Greedy Filter.
 
-    Dense: uses-tracking, check only affected pairs.
-    Sparse: full parallel APSP per candidate removal.
+    Per-edge: Dijkstra precheck, then full APSP + violation check.
     """
     if len(edges) <= 1:
         return list(edges), 0
@@ -326,9 +281,9 @@ def faster_dgf_one_pass(
 
         sel_filtered = [sel[i] for i in np.where(keep)[0]]
 
-    nw = _get_n_workers()
-    _log(f"Phase 2: uses-tracking, edges={len(sel_filtered)}, "
-         f"cpu_workers={nw}, CUDA={'yes' if _CUDA else 'no'}")
+    # ── Phase 2: precheck + GPU APSP per edge ─────────────────────────
+    _log(f"Phase 2: precheck + APSP per edge, edges={len(sel_filtered)}, "
+         f"CUDA={'yes' if _CUDA else 'no'}")
 
     # Build working CSR once
     csr = _build_csr(exists, dist_np, n)
@@ -338,20 +293,13 @@ def faster_dgf_one_pass(
     # Stats tracking
     stats_phase2: dict = {
         "precheck_necessary": 0,      # edge necessary at Dijkstra p->q
-        "precheck_passed": 0,          # passed precheck, need full check
-        "full_check_necessary": 0,     # necessary after full check
-        "full_check_removable": 0,     # removable after full check
-        "free_removals": 0,            # removed via empty uses (dense)
-        "skipped_already_removed": 0,  # skipped bc already gone
-        "time_precheck_s": 0.0,
-        "time_fullcheck_s": 0.0,
-        "time_uses_update_s": 0.0,
-        "time_clean_s": 0.0,
-        "apsp_calls": 0,
-        "apsp_total_s": 0.0,
+        "precheck_passed": 0,          # passed precheck, need full APSP
+        "full_check_necessary": 0,     # necessary after full APSP check
+        "full_check_removable": 0,     # removable after full APSP check
     }
-    _last_report = [0]  # mutable for closure
-    _report_interval = max(len(sel_filtered) // 20, 50)  # report ~20 times
+    apsp_stats: dict = {}
+    _last_report = [0]
+    _report_interval = max(len(sel_filtered) // 20, 50)
 
     def _report_progress(edge_idx: int, force: bool = False) -> None:
         if not force and edge_idx - _last_report[0] < _report_interval:
@@ -359,97 +307,35 @@ def faster_dgf_one_pass(
         _last_report[0] = edge_idx
         elapsed = time.perf_counter() - t_total
         s = stats_phase2
-        total_checked = s["precheck_necessary"] + s["precheck_passed"]
         _log(f"progress: edge {edge_idx}/{len(sel_filtered)} | "
              f"removed={removed} | elapsed={elapsed:.1f}s")
         _log(f"  precheck: {s['precheck_necessary']} necessary, "
-             f"{s['precheck_passed']} passed -> full check")
+             f"{s['precheck_passed']} passed -> full APSP")
         _log(f"  fullcheck: {s['full_check_necessary']} necessary, "
              f"{s['full_check_removable']} removable")
-        _log(f"  free={s['free_removals']}, skipped={s['skipped_already_removed']}")
-        _log(f"  time: precheck={s['time_precheck_s']:.2f}s, "
-             f"fullcheck={s['time_fullcheck_s']:.2f}s, "
-             f"uses_update={s['time_uses_update_s']:.2f}s, "
-             f"clean={s['time_clean_s']:.2f}s")
-        if s.get("apsp_calls", 0) > 0:
-            avg = s["apsp_total_s"] / s["apsp_calls"]
-            _log(f"  apsp: {s['apsp_calls']} calls, "
-                 f"total={s['apsp_total_s']:.2f}s, avg={avg*1000:.1f}ms")
-        if "uses_size_total" in s:
-            _log(f"  uses: {s.get('uses_n_edges',0)} edges tracked, "
-                 f"total_pairs={s['uses_size_total']}")
+        if apsp_stats.get("apsp_calls", 0) > 0:
+            avg = apsp_stats["apsp_total_s"] / apsp_stats["apsp_calls"]
+            _log(f"  apsp: {apsp_stats['apsp_calls']} calls, "
+                 f"total={apsp_stats['apsp_total_s']:.2f}s, avg={avg*1000:.1f}ms")
 
     # ══════════════════════════════════════════════════════════════════
-    # Uses-tracking path (always)
+    # Per-edge: precheck + full APSP + violation check
     # ══════════════════════════════════════════════════════════════════
-    _log("building initial uses map...")
-    t0 = time.perf_counter()
-    ccsr = _clean(csr)
-    edge_keys = set()
-    for e in sel_filtered:
-        edge_keys.add((min(e[0], e[1]), max(e[0], e[1])))
-    uses = _build_uses(ccsr, n, edge_keys)
-
-    # Batch free removal
-    free = [k for k, v in uses.items() if not v]
-    for u, v in free:
-        exists[u, v] = False
-        exists[v, u] = False
-        _csr_remove(csr, u, v)
-        del uses[(u, v)]
-        edge_keys.discard((u, v))
-    if free:
-        removed += len(free)
-        n_prefiltered += len(free)
-        stats_phase2["free_removals"] += len(free)
-
-    uses_total = sum(len(v) for v in uses.values())
-    _log(f"uses init in {time.perf_counter()-t0:.1f}s | "
-         f"batch_free={len(free)} | "
-         f"edges_tracked={len(uses)} | total_pairs={uses_total}")
-
-    removed_since_rebuild = 0
-    rebuild_interval = max(n // 2, 100)
-    _log(f"rebuild_interval={rebuild_interval}")
-
-    for edge_idx, edge in enumerate(tqdm(sel_filtered, desc="dgf(uses)", unit="edge", leave=False)):
+    for edge_idx, edge in enumerate(tqdm(sel_filtered, desc="dgf(apsp)", unit="edge", leave=False)):
         p, q = edge[0], edge[1]
         w = dist_np[p, q]
-        key = (min(p, q), max(p, q))
 
         if not exists[p, q]:
-            stats_phase2["skipped_already_removed"] += 1
             continue
 
-        pairs = uses.get(key, set())
-        if not pairs:
-            exists[p, q] = False
-            exists[q, p] = False
-            _csr_remove(csr, p, q)
-            uses.pop(key, None)
-            edge_keys.discard(key)
-            removed += 1
-            removed_since_rebuild += 1
-            stats_phase2["free_removals"] += 1
-            continue
-
-        # Tentatively remove
-        exists[p, q] = False
-        exists[q, p] = False
+        # 1. Tentatively remove
         _csr_remove(csr, p, q)
 
-        t0c = time.perf_counter()
-        ccsr = _clean(csr)
-        stats_phase2["time_clean_s"] += time.perf_counter() - t0c
-
-        # Quick check: Dijkstra p->q
-        t0p = time.perf_counter()
-        d_pq = sp_dijkstra(ccsr, indices=[p], limit=t * w, directed=False).ravel()
-        stats_phase2["time_precheck_s"] += time.perf_counter() - t0p
+        # 2. Precheck: Dijkstra from p with limit = t*w
+        d_pq = sp_dijkstra(csr, indices=[p], limit=t * w, directed=False).ravel()
 
         if d_pq[q] > t * w:
-            exists[p, q] = True
-            exists[q, p] = True
+            # Edge is necessary — restore immediately
             _csr_restore(csr, p, q, w)
             stats_phase2["precheck_necessary"] += 1
             _report_progress(edge_idx)
@@ -457,81 +343,29 @@ def faster_dgf_one_pass(
 
         stats_phase2["precheck_passed"] += 1
 
-        # Check affected pairs
-        t0f = time.perf_counter()
-        pair_list = list(pairs)
-        if key in pairs:
-            pair_list = [key] + [x for x in pair_list if x != key]
+        # 3. Full APSP on current CSR
+        sp_matrix = _parallel_apsp(csr, n, apsp_stats)
 
-        sources: list[int] = []
-        seen: set[int] = set()
-        for r, _ in pair_list:
-            if r not in seen:
-                seen.add(r)
-                sources.append(r)
-
-        d_rows = sp_dijkstra(ccsr, indices=sources, directed=False)
-        d_rows = np.atleast_2d(d_rows)
-        smap = {src: idx for idx, src in enumerate(sources)}
-
-        necessary = False
-        for (r, s) in pair_list:
-            if d_rows[smap[r], s] > t * dist_np[r, s]:
-                necessary = True
-                break
-        stats_phase2["time_fullcheck_s"] += time.perf_counter() - t0f
-
-        if necessary:
-            exists[p, q] = True
-            exists[q, p] = True
+        # 4. Violation check: any sp[i,j] > t * dist[i,j]?
+        if _any_violation(sp_matrix, dist_np, t, n):
+            # Violation found — edge is necessary, restore
             _csr_restore(csr, p, q, w)
             stats_phase2["full_check_necessary"] += 1
-            _report_progress(edge_idx)
-            continue
-
-        # Removable
-        removed += 1
-        removed_since_rebuild += 1
-        uses.pop(key, None)
-        edge_keys.discard(key)
-        stats_phase2["full_check_removable"] += 1
-
-        t0u = time.perf_counter()
-        _update_uses(ccsr, pair_list, uses)
-        stats_phase2["time_uses_update_s"] += time.perf_counter() - t0u
+        else:
+            # No violation — edge permanently removed
+            exists[p, q] = False
+            exists[q, p] = False
+            removed += 1
+            stats_phase2["full_check_removable"] += 1
 
         _report_progress(edge_idx)
 
-        # Periodic rebuild
-        if removed_since_rebuild >= rebuild_interval:
-            _log(f"rebuilding uses (removed_since={removed_since_rebuild})...")
-            t0r = time.perf_counter()
-            ccsr = _clean(csr)
-            uses = _build_uses(ccsr, n, edge_keys)
-            removed_since_rebuild = 0
-            nf = 0
-            for k in [k for k, v in uses.items() if not v]:
-                u, v = k
-                exists[u, v] = False
-                exists[v, u] = False
-                _csr_remove(csr, u, v)
-                del uses[k]
-                edge_keys.discard(k)
-                nf += 1
-            if nf:
-                removed += nf
-                stats_phase2["free_removals"] += nf
-            uses_total = sum(len(v) for v in uses.values())
-            stats_phase2["uses_size_total"] = uses_total
-            stats_phase2["uses_n_edges"] = len(uses)
-            _log(f"rebuild done in {time.perf_counter()-t0r:.1f}s | "
-                 f"batch_free={nf} | edges={len(uses)} | pairs={uses_total}")
-
     # ── Final report ──────────────────────────────────────────────────
     total_elapsed = time.perf_counter() - t_total
-    _log(f"DONE: {n_prefiltered + removed} total removed "
+    total_removed = n_prefiltered + removed
+    _log(f"DONE: {total_removed} total removed "
          f"({n_prefiltered} prefilter + {removed} phase2) in {total_elapsed:.1f}s")
     _report_progress(len(sel_filtered), force=True)
 
     remaining = [e for e in sel if exists[e[0], e[1]]]
-    return remaining, n_prefiltered + removed
+    return remaining, total_removed
