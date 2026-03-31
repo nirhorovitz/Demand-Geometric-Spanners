@@ -46,16 +46,12 @@ def _build_adjacency(
     return adj
 
 
+from scipy.sparse.csgraph import shortest_path
+
 def _floyd_warshall(adj: np.ndarray) -> np.ndarray:
-    """All-pairs shortest paths via Floyd-Warshall. Returns n x n distance matrix."""
-    n = adj.shape[0]
-    dist = adj.copy()
-    for k in range(n):
-        for i in range(n):
-            for j in range(n):
-                if dist[i, k] + dist[k, j] < dist[i, j]:
-                    dist[i, j] = dist[i, k] + dist[k, j]
-    return dist
+    """All-pairs shortest paths via Floyd-Warshall (scipy). Returns n x n distance matrix."""
+    # use scipy for C-level performance instead of Python triple-loops
+    return shortest_path(adj, directed=False)
 
 
 def apsp_shortest_path_after_removal(
@@ -229,6 +225,7 @@ def compute_metrics(
         relative_weight_to_mst, max_degree, average_degree, max_stretch.
         When stretch verification is skipped: verification_note, max_stretch=None.
     """
+    print("        [compute_metrics] Starting...", flush=True)
     n = points.shape[0]
     edges = np.asarray(edges, dtype=np.int64)
     if edges.ndim == 1 and edges.size > 0:
@@ -241,6 +238,8 @@ def compute_metrics(
     )
     skip_stretch = n > threshold
 
+    print(f"        [compute_metrics] n={n}, threshold={threshold}, skip_stretch={skip_stretch}", flush=True)
+
     if problem_type == "t":
         dist_matrix = _euclidean_distances(points)
     else:
@@ -250,22 +249,31 @@ def compute_metrics(
         dist_matrix = np.asarray(weight, dtype=np.float64)
 
     if skip_stretch:
+        print("        [compute_metrics] Skipping stretch verification...", flush=True)
         max_stretch = None
         verification_note = _stretch_verification_skipped_note(n, threshold)
         status = False  # Unknown; conservative
     else:
+        print("        [compute_metrics] Computing max stretch...", flush=True)
         max_stretch = _compute_max_stretch(edges, n, dist_matrix)
+        print("        [compute_metrics] Max stretch computed.", flush=True)
         verification_note = None
 
+    print("        [compute_metrics] Computing absolute weight...", flush=True)
     abs_w = _absolute_weight(edges, dist_matrix)
+    print("        [compute_metrics] Computing MST weight...", flush=True)
     mst_w = mst_weight(points, weight, problem_type)
+    print("        [compute_metrics] Computing degrees...", flush=True)
     max_deg, avg_deg = _compute_degrees(edges, n)
+
+    print("        [compute_metrics] Evaluating final metrics...", flush=True)
 
     # relative_weight_to_mst: abs_w / mst_w. Handle zero MST (n<=1) and zero edges.
     if mst_w <= 0:
         rel_to_mst = 0.0 if abs_w <= 0 else np.inf
     else:
         rel_to_mst = abs_w / mst_w
+    print("        [compute_metrics] Relative weight to MST computed.", flush=True)
 
     # status: valid iff max_stretch <= t (with tolerance). When skipped, False.
     if not skip_stretch:
@@ -276,7 +284,7 @@ def compute_metrics(
                 max_stretch, t, rtol=0, atol=stretch_tolerance
             )
         status = bool(status)
-
+    print("        [compute_metrics] Status computed.", flush=True)
     out: dict = {
         "runtime_ms": runtime_ms,
         "edge_count": int(edges.shape[0]),
@@ -293,4 +301,5 @@ def compute_metrics(
     }
     if verification_note is not None:
         out["verification_note"] = verification_note
+    print("        [compute_metrics] Returning results.", flush=True)
     return out

@@ -9,7 +9,7 @@
 #SBATCH --mem=24G
 
 # -u is used to watch live progress and prevent buffered printing 
-python -u final_experiment.py --n 8000 
 python -u final_experiment.py --n 4000
-python -u final_experiment.py --n 8000 --force-dgf
 python -u final_experiment.py --n 4000 --force-dgf
+python -u final_experiment.py --n 8000 
+python -u final_experiment.py --n 8000 --force-dgf
