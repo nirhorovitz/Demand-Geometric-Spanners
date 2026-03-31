@@ -256,24 +256,24 @@ def compute_metrics(
     else:
         print("        [compute_metrics] Computing max stretch...", flush=True)
         max_stretch = _compute_max_stretch(edges, n, dist_matrix)
-        print("        [compute_metrics] Max stretch computed.", flush=True)
+        print("        [compute_metrics] Max stretch computed. max_stretch={max_stretch}", flush=True)
         verification_note = None
 
     print("        [compute_metrics] Computing absolute weight...", flush=True)
     abs_w = _absolute_weight(edges, dist_matrix)
-    print("        [compute_metrics] Computing MST weight...", flush=True)
+    print("        [compute_metrics] Computing MST weight... abs_w={abs_w}", flush=True)
     mst_w = mst_weight(points, weight, problem_type)
-    print("        [compute_metrics] Computing degrees...", flush=True)
+    print("        [compute_metrics] Computing degrees... mst_w={mst_w}", flush=True)
     max_deg, avg_deg = _compute_degrees(edges, n)
 
-    print("        [compute_metrics] Evaluating final metrics...", flush=True)
+    print("        [compute_metrics] Evaluating final metrics... max_deg={max_deg}, avg_deg={avg_deg}", flush=True)
 
     # relative_weight_to_mst: abs_w / mst_w. Handle zero MST (n<=1) and zero edges.
     if mst_w <= 0:
         rel_to_mst = 0.0 if abs_w <= 0 else np.inf
     else:
         rel_to_mst = abs_w / mst_w
-    print("        [compute_metrics] Relative weight to MST computed.", flush=True)
+    print("        [compute_metrics] Relative weight to MST computed. rel_to_mst={rel_to_mst}", flush=True)
 
     # status: valid iff max_stretch <= t (with tolerance). When skipped, False.
     if not skip_stretch:
@@ -284,7 +284,7 @@ def compute_metrics(
                 max_stretch, t, rtol=0, atol=stretch_tolerance
             )
         status = bool(status)
-    print("        [compute_metrics] Status computed.", flush=True)
+    print("        [compute_metrics] Status computed. status={status}", flush=True)
     out: dict = {
         "runtime_ms": runtime_ms,
         "edge_count": int(edges.shape[0]),
@@ -301,5 +301,5 @@ def compute_metrics(
     }
     if verification_note is not None:
         out["verification_note"] = verification_note
-    print("        [compute_metrics] Returning results.", flush=True)
+    print("        [compute_metrics] Returning results. out={out}", flush=True)
     return out
