@@ -216,6 +216,7 @@ def _bisect_batch(
     t: float,
     batch: list[tuple[int, int, float]],
     apsp_stats: dict,
+    bisect_stats: dict,
 ) -> tuple[int, list[tuple[int, int, float]]]:
     """
     All edges in *batch* are already removed from csr.
@@ -243,6 +244,7 @@ def _bisect_batch(
     if len(batch) == 1:
         p, q, w = batch[0]
         _csr_restore(csr, p, q, w)
+        bisect_stats["apsp_necessary"] += 1
         return 0, []
 
     # Split: longer = heavier edges (first half), shorter = lighter (second half)
@@ -252,10 +254,11 @@ def _bisect_batch(
     # Restore shorter half back to CSR — defer for later
     for p, q, w in shorter:
         _csr_restore(csr, p, q, w)
+    bisect_stats["deferred"] += len(shorter)
 
     # Recurse on longer half (still removed from CSR)
     longer_removed, longer_deferred = _bisect_batch(
-        csr, exists, dist_np, n, t, longer, apsp_stats)
+        csr, exists, dist_np, n, t, longer, apsp_stats, bisect_stats)
 
     return longer_removed, longer_deferred + shorter
 
@@ -315,18 +318,25 @@ def faster_dgf_one_pass(
     removed = 0
     precheck_necessary = 0
     precheck_passed = 0
+    heap_pops = 0
     apsp_stats: dict = {}
+    bisect_stats: dict = {"apsp_necessary": 0, "deferred": 0}
     buffer: list[tuple[int, int, float]] = []
 
     # Max-heap: (-weight, p, q) so heaviest edges come first
     heap: list[tuple[float, int, int]] = [(-dist_np[e[0], e[1]], e[0], e[1]) for e in sel]
     heapq.heapify(heap)
 
+    def _settled() -> int:
+        """Edges done forever: removed + necessary (precheck + APSP)."""
+        return removed + precheck_necessary + bisect_stats["apsp_necessary"]
+
     def _flush_buffer() -> int:
         nonlocal buffer
         if not buffer:
             return 0
-        r, deferred_edges = _bisect_batch(csr, exists, dist_np, n, t, buffer, apsp_stats)
+        r, deferred_edges = _bisect_batch(
+            csr, exists, dist_np, n, t, buffer, apsp_stats, bisect_stats)
         # Push shorter edges back onto heap — they'll be retried in order
         for dp, dq, dw in deferred_edges:
             heapq.heappush(heap, (-dw, dp, dq))
@@ -336,12 +346,22 @@ def faster_dgf_one_pass(
         buffer = []
         return r
 
+    def _status() -> str:
+        s = _settled()
+        return (f"removed={removed} necessary={precheck_necessary + bisect_stats['apsp_necessary']}"
+                f" (precheck={precheck_necessary} apsp={bisect_stats['apsp_necessary']})"
+                f" settled={s}/{n_edges} ({100*s/n_edges:.1f}%)"
+                f" heap_pops={heap_pops} deferred={bisect_stats['deferred']}"
+                f" apsp_calls={apsp_stats.get('apsp_calls', 0)}"
+                f" elapsed={time.perf_counter()-t_total:.1f}s")
+
     # ── Precheck + batched APSP bisection ────────────────────────────
     bar = tqdm(total=len(heap), desc="dgf", unit="edge", leave=False)
 
     while heap:
         neg_w, p, q = heapq.heappop(heap)
         w = -neg_w
+        heap_pops += 1
 
         if not exists[p, q]:
             bar.update(1)
@@ -364,10 +384,7 @@ def faster_dgf_one_pass(
                 buf_size = len(buffer)
                 r = _flush_buffer()
                 removed += r
-                _log(f"precheck-triggered flush: +{r}/{buf_size} removed "
-                     f"(total {removed}) | "
-                     f"apsp calls: {apsp_stats.get('apsp_calls', 0)} | "
-                     f"elapsed: {time.perf_counter()-t_total:.1f}s")
+                _log(f"precheck-triggered flush: +{r}/{buf_size} | {_status()}")
             continue
 
         # 3. Passed precheck — edge stays removed in CSR, buffer it
@@ -378,11 +395,7 @@ def faster_dgf_one_pass(
         if len(buffer) >= _BATCH_SIZE:
             r = _flush_buffer()
             removed += r
-            _log(f"batch done: +{r} removed (total {removed}) | "
-                 f"precheck: {precheck_necessary} necessary, "
-                 f"{precheck_passed} passed | "
-                 f"apsp calls: {apsp_stats.get('apsp_calls', 0)} | "
-                 f"elapsed: {time.perf_counter()-t_total:.1f}s")
+            _log(f"batch done: +{r} | {_status()}")
 
     # Flush remaining buffer
     removed += _flush_buffer()
@@ -390,10 +403,8 @@ def faster_dgf_one_pass(
 
     # ── Final report ──────────────────────────────────────────────────
     total_elapsed = time.perf_counter() - t_total
-    _log(f"DONE: {removed} removed / {n_edges} total in {total_elapsed:.1f}s")
-    _log(f"  precheck: {precheck_necessary} necessary, {precheck_passed} passed")
-    _log(f"  apsp: {apsp_stats.get('apsp_calls', 0)} calls, "
-         f"total={apsp_stats.get('apsp_total_s', 0):.2f}s")
+    _log(f"DONE in {total_elapsed:.1f}s | {_status()}")
+    _log(f"  apsp time: {apsp_stats.get('apsp_total_s', 0):.2f}s")
 
     remaining = [e for e in sel if exists[e[0], e[1]]]
     return remaining, removed
