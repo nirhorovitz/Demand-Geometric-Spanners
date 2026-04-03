@@ -205,7 +205,7 @@ def _parallel_apsp(csr: sp_sparse.csr_matrix, n: int, stats: dict | None = None)
 
 # ── Batch bisection ─────────────────────────────────────────────────────────
 
-_BATCH_SIZE = int(os.environ.get("DGF_BATCH", "64"))
+_BATCH_SIZE = int(os.environ.get("DGF_BATCH", "2056"))
 
 
 def _bisect_batch(
@@ -358,6 +358,16 @@ def faster_dgf_one_pass(
             precheck_necessary += 1
             processed += 1
             bar.update(1)
+            # Precheck failure signals we're in the critical zone —
+            # flush whatever we've buffered so far
+            if buffer:
+                buf_size = len(buffer)
+                r = _flush_buffer()
+                removed += r
+                _log(f"precheck-triggered flush: +{r}/{buf_size} removed "
+                     f"(total {removed}) | "
+                     f"apsp calls: {apsp_stats.get('apsp_calls', 0)} | "
+                     f"elapsed: {time.perf_counter()-t_total:.1f}s")
             continue
 
         # 3. Passed precheck — edge stays removed in CSR, buffer it
