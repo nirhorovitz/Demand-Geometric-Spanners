@@ -1,12 +1,11 @@
 """
-Faster DGF (Descending Greedy Filter) v6
+Faster DGF (Descending Greedy Filter) v7
 =========================================
-Dijkstra precheck per edge, then batched APSP with binary-search bisection.
+Batched APSP with full recursive bisection. No precheck, no deferral.
 
-Edges that pass the cheap Dijkstra precheck are buffered. When the buffer
-fills, one APSP + violation check tests the whole batch. If clean, all are
-removed in one shot. If violated, recursive bisection finds which edges are
-necessary — worst case 2x the per-edge cost, best case batch_size/1 speedup.
+Edges sorted by descending weight are buffered into batches. Each batch is
+tested with one APSP + violation check. If clean, all removed in one shot.
+If violated, recurse on both halves to find all necessary edges.
 
 Interface:
     faster_dgf_one_pass(edges, dist_np, n, t) -> (remaining_edges, n_removed)
@@ -14,7 +13,6 @@ Interface:
 
 from __future__ import annotations
 
-import heapq
 import os
 import time
 from typing import Optional
@@ -205,7 +203,7 @@ def _parallel_apsp(csr: sp_sparse.csr_matrix, n: int, stats: dict | None = None)
 
 # ── Batch bisection ─────────────────────────────────────────────────────────
 
-_BATCH_SIZE = int(os.environ.get("DGF_BATCH", "2056"))
+_BATCH_SIZE = int(os.environ.get("DGF_BATCH", "4096"))
 
 
 def _bisect_batch(
@@ -217,19 +215,18 @@ def _bisect_batch(
     batch: list[tuple[int, int, float]],
     apsp_stats: dict,
     bisect_stats: dict,
-) -> tuple[int, list[tuple[int, int, float]]]:
+) -> int:
     """
     All edges in *batch* are already removed from csr.
-    Batch is in descending weight order: batch[:mid] = longer, batch[mid:] = shorter.
+    Batch is in descending weight order.
 
-    On violation: restore the shorter half back to CSR and defer it (returned
-    to caller so the main loop retries them later in normal order).  Recurse
-    on the longer half only.
+    On violation: restore all, then recurse on first half (longer edges),
+    then recurse on second half (shorter edges). Both halves fully resolved.
 
-    Returns (n_removed, deferred_edges).
+    Returns number of edges permanently removed.
     """
     if not batch:
-        return 0, []
+        return 0
 
     # One APSP for the whole batch
     sp_matrix = _parallel_apsp(csr, n, apsp_stats)
@@ -238,29 +235,33 @@ def _bisect_batch(
         for p, q, _w in batch:
             exists[p, q] = False
             exists[q, p] = False
-        return len(batch), []
+        return len(batch)
 
     # Single edge that causes violation → necessary, restore it
     if len(batch) == 1:
         p, q, w = batch[0]
         _csr_restore(csr, p, q, w)
-        bisect_stats["apsp_necessary"] += 1
-        return 0, []
+        bisect_stats["necessary"] += 1
+        return 0
 
-    # Split: longer = heavier edges (first half), shorter = lighter (second half)
-    mid = len(batch) // 2
-    longer, shorter = batch[:mid], batch[mid:]
-
-    # Restore shorter half back to CSR — defer for later
-    for p, q, w in shorter:
+    # Restore all, then recurse on both halves
+    for p, q, w in batch:
         _csr_restore(csr, p, q, w)
-    bisect_stats["deferred"] += len(shorter)
 
-    # Recurse on longer half (still removed from CSR)
-    longer_removed, longer_deferred = _bisect_batch(
-        csr, exists, dist_np, n, t, longer, apsp_stats, bisect_stats)
+    mid = len(batch) // 2
+    first_half, second_half = batch[:mid], batch[mid:]
 
-    return longer_removed, longer_deferred + shorter
+    # Process first half (longer/heavier edges)
+    for p, q, _w in first_half:
+        _csr_remove(csr, p, q)
+    first_removed = _bisect_batch(csr, exists, dist_np, n, t, first_half, apsp_stats, bisect_stats)
+
+    # Process second half (shorter/lighter edges)
+    for p, q, _w in second_half:
+        _csr_remove(csr, p, q)
+    second_removed = _bisect_batch(csr, exists, dist_np, n, t, second_half, apsp_stats, bisect_stats)
+
+    return first_removed + second_removed
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -272,7 +273,8 @@ def faster_dgf_one_pass(
     t: float,
 ) -> tuple[list[tuple[int, int]], int]:
     """
-    Descending Greedy Filter v6 — Dijkstra precheck + batched APSP bisection.
+    Descending Greedy Filter v7 — batched APSP with full recursive bisection.
+    No precheck, no deferral.
     """
     if len(edges) <= 1:
         return list(edges), 0
@@ -313,98 +315,49 @@ def faster_dgf_one_pass(
         exists[v, u] = True
 
     csr = _build_csr(exists, dist_np, n)
-    _log(f"precheck + batched APSP bisection, CUDA={'yes' if _CUDA else 'no'}")
 
     removed = 0
-    precheck_necessary = 0
-    precheck_passed = 0
-    heap_pops = 0
     apsp_stats: dict = {}
-    bisect_stats: dict = {"apsp_necessary": 0, "deferred": 0}
-    buffer: list[tuple[int, int, float]] = []
+    bisect_stats: dict = {"necessary": 0}
 
-    # Max-heap: (-weight, p, q) so heaviest edges come first
-    heap: list[tuple[float, int, int]] = [(-dist_np[e[0], e[1]], e[0], e[1]) for e in sel]
-    heapq.heapify(heap)
+    _log(f"batched APSP bisection (no precheck), CUDA={'yes' if _CUDA else 'no'}")
 
-    def _settled() -> int:
-        """Edges done forever: removed + necessary (precheck + APSP)."""
-        return removed + precheck_necessary + bisect_stats["apsp_necessary"]
+    # ── Buffer edges into batches, bisect each ────────────────────────
+    n_batches = (n_edges + _BATCH_SIZE - 1) // _BATCH_SIZE
+    bar = tqdm(total=n_batches, desc="dgf", unit="batch", leave=False)
 
-    def _flush_buffer() -> int:
-        nonlocal buffer
-        if not buffer:
-            return 0
-        r, deferred_edges = _bisect_batch(
-            csr, exists, dist_np, n, t, buffer, apsp_stats, bisect_stats)
-        # Push shorter edges back onto heap — they'll be retried in order
-        for dp, dq, dw in deferred_edges:
-            heapq.heappush(heap, (-dw, dp, dq))
-        if deferred_edges:
-            bar.total += len(deferred_edges)
-            bar.refresh()
-        buffer = []
-        return r
+    for batch_start in range(0, n_edges, _BATCH_SIZE):
+        batch_end = min(batch_start + _BATCH_SIZE, n_edges)
+        batch = [(p, q, dist_np[p, q]) for p, q in sel[batch_start:batch_end]]
 
-    def _status() -> str:
-        s = _settled()
-        return (f"removed={removed} necessary={precheck_necessary + bisect_stats['apsp_necessary']}"
-                f" (precheck={precheck_necessary} apsp={bisect_stats['apsp_necessary']})"
-                f" settled={s}/{n_edges} ({100*s/n_edges:.1f}%)"
-                f" heap_pops={heap_pops} deferred={bisect_stats['deferred']}"
-                f" apsp_calls={apsp_stats.get('apsp_calls', 0)}"
-                f" elapsed={time.perf_counter()-t_total:.1f}s")
+        # Remove all batch edges from CSR
+        for p, q, _w in batch:
+            _csr_remove(csr, p, q)
 
-    # ── Precheck + batched APSP bisection ────────────────────────────
-    bar = tqdm(total=len(heap), desc="dgf", unit="edge", leave=False)
+        # Bisect
+        r = _bisect_batch(csr, exists, dist_np, n, t, batch, apsp_stats, bisect_stats)
+        removed += r
 
-    while heap:
-        neg_w, p, q = heapq.heappop(heap)
-        w = -neg_w
-        heap_pops += 1
-
-        if not exists[p, q]:
-            bar.update(1)
-            continue
-
-        # 1. Tentatively remove
-        _csr_remove(csr, p, q)
-
-        # 2. Dijkstra precheck from p with limit = t*w
-        d_pq = sp_dijkstra(csr, indices=[p], limit=t * w, directed=False).ravel()
-
-        if d_pq[q] > t * w:
-            # Necessary — restore immediately, never enters batch
-            _csr_restore(csr, p, q, w)
-            precheck_necessary += 1
-            bar.update(1)
-            # Precheck failure signals we're in the critical zone —
-            # flush whatever we've buffered so far
-            if buffer:
-                buf_size = len(buffer)
-                r = _flush_buffer()
-                removed += r
-                _log(f"precheck-triggered flush: +{r}/{buf_size} | {_status()}")
-            continue
-
-        # 3. Passed precheck — edge stays removed in CSR, buffer it
-        precheck_passed += 1
-        buffer.append((p, q, w))
+        settled = removed + bisect_stats["necessary"]
+        _log(f"batch {batch_start//(_BATCH_SIZE)+1}/{n_batches}: "
+             f"+{r}/{len(batch)} removed | "
+             f"settled={settled}/{n_edges} ({100*settled/n_edges:.1f}%) | "
+             f"removed={removed} necessary={bisect_stats['necessary']} | "
+             f"apsp: {apsp_stats.get('apsp_calls', 0)} calls, "
+             f"{apsp_stats.get('apsp_total_s', 0):.1f}s | "
+             f"elapsed={time.perf_counter()-t_total:.1f}s")
         bar.update(1)
 
-        if len(buffer) >= _BATCH_SIZE:
-            r = _flush_buffer()
-            removed += r
-            _log(f"batch done: +{r} | {_status()}")
-
-    # Flush remaining buffer
-    removed += _flush_buffer()
     bar.close()
 
     # ── Final report ──────────────────────────────────────────────────
     total_elapsed = time.perf_counter() - t_total
-    _log(f"DONE in {total_elapsed:.1f}s | {_status()}")
-    _log(f"  apsp time: {apsp_stats.get('apsp_total_s', 0):.2f}s")
+    settled = removed + bisect_stats["necessary"]
+    _log(f"DONE in {total_elapsed:.1f}s | "
+         f"removed={removed} necessary={bisect_stats['necessary']} "
+         f"settled={settled}/{n_edges} | "
+         f"apsp_calls={apsp_stats.get('apsp_calls', 0)} "
+         f"apsp_time={apsp_stats.get('apsp_total_s', 0):.2f}s")
 
     remaining = [e for e in sel if exists[e[0], e[1]]]
     return remaining, removed
