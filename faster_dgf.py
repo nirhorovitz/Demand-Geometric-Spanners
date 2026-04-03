@@ -326,23 +326,24 @@ def faster_dgf_one_pass(
         nonlocal buffer
         if not buffer:
             return 0
-        r, deferred = _bisect_batch(csr, exists, dist_np, n, t, buffer, apsp_stats)
+        r, deferred_edges = _bisect_batch(csr, exists, dist_np, n, t, buffer, apsp_stats)
         # Push shorter edges back onto heap — they'll be retried in order
-        for dp, dq, dw in deferred:
+        for dp, dq, dw in deferred_edges:
             heapq.heappush(heap, (-dw, dp, dq))
+        if deferred_edges:
+            bar.total += len(deferred_edges)
+            bar.refresh()
         buffer = []
         return r
 
     # ── Precheck + batched APSP bisection ────────────────────────────
-    processed = 0
-    bar = tqdm(total=n_edges, desc="dgf", unit="edge", leave=False)
+    bar = tqdm(total=len(heap), desc="dgf", unit="edge", leave=False)
 
     while heap:
         neg_w, p, q = heapq.heappop(heap)
         w = -neg_w
 
         if not exists[p, q]:
-            processed += 1
             bar.update(1)
             continue
 
@@ -356,7 +357,6 @@ def faster_dgf_one_pass(
             # Necessary — restore immediately, never enters batch
             _csr_restore(csr, p, q, w)
             precheck_necessary += 1
-            processed += 1
             bar.update(1)
             # Precheck failure signals we're in the critical zone —
             # flush whatever we've buffered so far
@@ -373,7 +373,6 @@ def faster_dgf_one_pass(
         # 3. Passed precheck — edge stays removed in CSR, buffer it
         precheck_passed += 1
         buffer.append((p, q, w))
-        processed += 1
         bar.update(1)
 
         if len(buffer) >= _BATCH_SIZE:
