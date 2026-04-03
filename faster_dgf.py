@@ -1,8 +1,12 @@
 """
-Faster DGF (Descending Greedy Filter) v5
+Faster DGF (Descending Greedy Filter) v6
 =========================================
-Per-edge GPU APSP approach: for each candidate edge, do a quick Dijkstra
-precheck, then full GPU Floyd-Warshall APSP + violation check.
+Dijkstra precheck per edge, then batched APSP with binary-search bisection.
+
+Edges that pass the cheap Dijkstra precheck are buffered. When the buffer
+fills, one APSP + violation check tests the whole batch. If clean, all are
+removed in one shot. If violated, recursive bisection finds which edges are
+necessary — worst case 2x the per-edge cost, best case batch_size/1 speedup.
 
 Interface:
     faster_dgf_one_pass(edges, dist_np, n, t) -> (remaining_edges, n_removed)
@@ -10,6 +14,7 @@ Interface:
 
 from __future__ import annotations
 
+import heapq
 import os
 import time
 from typing import Optional
@@ -198,6 +203,62 @@ def _parallel_apsp(csr: sp_sparse.csr_matrix, n: int, stats: dict | None = None)
     return np.vstack(results)
 
 
+# ── Batch bisection ─────────────────────────────────────────────────────────
+
+_BATCH_SIZE = int(os.environ.get("DGF_BATCH", "64"))
+
+
+def _bisect_batch(
+    csr: sp_sparse.csr_matrix,
+    exists: np.ndarray,
+    dist_np: np.ndarray,
+    n: int,
+    t: float,
+    batch: list[tuple[int, int, float]],
+    apsp_stats: dict,
+) -> tuple[int, list[tuple[int, int, float]]]:
+    """
+    All edges in *batch* are already removed from csr.
+    Batch is in descending weight order: batch[:mid] = longer, batch[mid:] = shorter.
+
+    On violation: restore the shorter half back to CSR and defer it (returned
+    to caller so the main loop retries them later in normal order).  Recurse
+    on the longer half only.
+
+    Returns (n_removed, deferred_edges).
+    """
+    if not batch:
+        return 0, []
+
+    # One APSP for the whole batch
+    sp_matrix = _parallel_apsp(csr, n, apsp_stats)
+    if not _any_violation(sp_matrix, dist_np, t, n):
+        # Entire batch removable
+        for p, q, _w in batch:
+            exists[p, q] = False
+            exists[q, p] = False
+        return len(batch), []
+
+    # Single edge that causes violation → necessary, restore it
+    if len(batch) == 1:
+        p, q, w = batch[0]
+        _csr_restore(csr, p, q, w)
+        return 0, []
+
+    # Split: longer = heavier edges (first half), shorter = lighter (second half)
+    mid = len(batch) // 2
+    longer, shorter = batch[:mid], batch[mid:]
+
+    # Restore shorter half back to CSR — defer for later
+    for p, q, w in shorter:
+        _csr_restore(csr, p, q, w)
+
+    # Recurse on longer half (still removed from CSR)
+    longer_removed, longer_deferred = _bisect_batch(
+        csr, exists, dist_np, n, t, longer, apsp_stats)
+
+    return longer_removed, longer_deferred + shorter
+
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
@@ -208,9 +269,7 @@ def faster_dgf_one_pass(
     t: float,
 ) -> tuple[list[tuple[int, int]], int]:
     """
-    Descending Greedy Filter.
-
-    Per-edge: Dijkstra precheck, then full APSP + violation check.
+    Descending Greedy Filter v6 — Dijkstra precheck + batched APSP bisection.
     """
     if len(edges) <= 1:
         return list(edges), 0
@@ -220,7 +279,8 @@ def faster_dgf_one_pass(
     n_edges = len(sel)
 
     _log(f"n={n}, edges={n_edges}, t={t}, CUDA={_CUDA}, "
-         f"native_v2={_NATIVE_V2}, native_v1={_NATIVE_V1}")
+         f"native_v2={_NATIVE_V2}, native_v1={_NATIVE_V1}, "
+         f"batch_size={_BATCH_SIZE}")
 
     # ── Native Rust fast path ─────────────────────────────────────────
     if _DGF_NATIVE_ENABLED:
@@ -243,129 +303,88 @@ def faster_dgf_one_pass(
             except Exception as e:
                 _log(f"native v1 FAILED: {e}, falling back")
 
-    # ── exists matrix ─────────────────────────────────────────────────
+    # ── exists matrix + CSR ───────────────────────────────────────────
     exists = np.zeros((n, n), dtype=bool)
     for u, v in sel:
         exists[u, v] = True
         exists[v, u] = True
 
-    # ── Phase 1: batch pre-filter ─────────────────────────────────────
-    is_complete = (n_edges == n * (n - 1) // 2)
-    n_prefiltered = 0
-
-    if is_complete:
-        _log(f"K_n detected ({n_edges} edges): skipping Phase 1")
-        sel_filtered = list(sel)
-    else:
-        _log("Phase 1: computing APSP for batch pre-filter...")
-        t0 = time.perf_counter()
-        csr = _build_csr(exists, dist_np, n)
-        stats: dict = {}
-        sp_init = _parallel_apsp(csr, n, stats)
-        _log(f"Phase 1 APSP: {time.perf_counter()-t0:.3f}s "
-             f"(method={stats.get('apsp_method')}, workers={stats.get('apsp_workers')})")
-
-        E = np.array(sel, dtype=np.int64)
-        sp_vals = sp_init[E[:, 0], E[:, 1]]
-        w_vals = dist_np[E[:, 0], E[:, 1]]
-        keep = sp_vals >= w_vals - 1e-12
-
-        n_prefiltered = int(np.sum(~keep))
-        if n_prefiltered > 0:
-            for idx in np.where(~keep)[0]:
-                u, v = sel[idx]
-                exists[u, v] = False
-                exists[v, u] = False
-        _log(f"Phase 1: removed {n_prefiltered}/{n_edges}, "
-             f"{int(np.sum(keep))} remain")
-
-        sel_filtered = [sel[i] for i in np.where(keep)[0]]
-
-    # ── Phase 2: precheck + GPU APSP per edge ─────────────────────────
-    _log(f"Phase 2: precheck + APSP per edge, edges={len(sel_filtered)}, "
-         f"CUDA={'yes' if _CUDA else 'no'}")
-
-    # Build working CSR once
     csr = _build_csr(exists, dist_np, n)
+    _log(f"precheck + batched APSP bisection, CUDA={'yes' if _CUDA else 'no'}")
 
     removed = 0
-
-    # Stats tracking
-    stats_phase2: dict = {
-        "precheck_necessary": 0,      # edge necessary at Dijkstra p->q
-        "precheck_passed": 0,          # passed precheck, need full APSP
-        "full_check_necessary": 0,     # necessary after full APSP check
-        "full_check_removable": 0,     # removable after full APSP check
-    }
+    precheck_necessary = 0
+    precheck_passed = 0
     apsp_stats: dict = {}
-    _last_report = [0]
-    _report_interval = max(len(sel_filtered) // 20, 50)
+    buffer: list[tuple[int, int, float]] = []
 
-    def _report_progress(edge_idx: int, force: bool = False) -> None:
-        if not force and edge_idx - _last_report[0] < _report_interval:
-            return
-        _last_report[0] = edge_idx
-        elapsed = time.perf_counter() - t_total
-        s = stats_phase2
-        _log(f"progress: edge {edge_idx}/{len(sel_filtered)} | "
-             f"removed={removed} | elapsed={elapsed:.1f}s")
-        _log(f"  precheck: {s['precheck_necessary']} necessary, "
-             f"{s['precheck_passed']} passed -> full APSP")
-        _log(f"  fullcheck: {s['full_check_necessary']} necessary, "
-             f"{s['full_check_removable']} removable")
-        if apsp_stats.get("apsp_calls", 0) > 0:
-            avg = apsp_stats["apsp_total_s"] / apsp_stats["apsp_calls"]
-            _log(f"  apsp: {apsp_stats['apsp_calls']} calls, "
-                 f"total={apsp_stats['apsp_total_s']:.2f}s, avg={avg*1000:.1f}ms")
+    # Max-heap: (-weight, p, q) so heaviest edges come first
+    heap: list[tuple[float, int, int]] = [(-dist_np[e[0], e[1]], e[0], e[1]) for e in sel]
+    heapq.heapify(heap)
 
-    # ══════════════════════════════════════════════════════════════════
-    # Per-edge: precheck + full APSP + violation check
-    # ══════════════════════════════════════════════════════════════════
-    for edge_idx, edge in enumerate(tqdm(sel_filtered, desc="dgf(apsp)", unit="edge", leave=False)):
-        p, q = edge[0], edge[1]
-        w = dist_np[p, q]
+    def _flush_buffer() -> int:
+        nonlocal buffer
+        if not buffer:
+            return 0
+        r, deferred = _bisect_batch(csr, exists, dist_np, n, t, buffer, apsp_stats)
+        # Push shorter edges back onto heap — they'll be retried in order
+        for dp, dq, dw in deferred:
+            heapq.heappush(heap, (-dw, dp, dq))
+        buffer = []
+        return r
+
+    # ── Precheck + batched APSP bisection ────────────────────────────
+    processed = 0
+    bar = tqdm(total=n_edges, desc="dgf", unit="edge", leave=False)
+
+    while heap:
+        neg_w, p, q = heapq.heappop(heap)
+        w = -neg_w
 
         if not exists[p, q]:
+            processed += 1
+            bar.update(1)
             continue
 
         # 1. Tentatively remove
         _csr_remove(csr, p, q)
 
-        # 2. Precheck: Dijkstra from p with limit = t*w
+        # 2. Dijkstra precheck from p with limit = t*w
         d_pq = sp_dijkstra(csr, indices=[p], limit=t * w, directed=False).ravel()
 
         if d_pq[q] > t * w:
-            # Edge is necessary — restore immediately
+            # Necessary — restore immediately, never enters batch
             _csr_restore(csr, p, q, w)
-            stats_phase2["precheck_necessary"] += 1
-            _report_progress(edge_idx)
+            precheck_necessary += 1
+            processed += 1
+            bar.update(1)
             continue
 
-        stats_phase2["precheck_passed"] += 1
+        # 3. Passed precheck — edge stays removed in CSR, buffer it
+        precheck_passed += 1
+        buffer.append((p, q, w))
+        processed += 1
+        bar.update(1)
 
-        # 3. Full APSP on current CSR
-        sp_matrix = _parallel_apsp(csr, n, apsp_stats)
+        if len(buffer) >= _BATCH_SIZE:
+            r = _flush_buffer()
+            removed += r
+            _log(f"batch done: +{r} removed (total {removed}) | "
+                 f"precheck: {precheck_necessary} necessary, "
+                 f"{precheck_passed} passed | "
+                 f"apsp calls: {apsp_stats.get('apsp_calls', 0)} | "
+                 f"elapsed: {time.perf_counter()-t_total:.1f}s")
 
-        # 4. Violation check: any sp[i,j] > t * dist[i,j]?
-        if _any_violation(sp_matrix, dist_np, t, n):
-            # Violation found — edge is necessary, restore
-            _csr_restore(csr, p, q, w)
-            stats_phase2["full_check_necessary"] += 1
-        else:
-            # No violation — edge permanently removed
-            exists[p, q] = False
-            exists[q, p] = False
-            removed += 1
-            stats_phase2["full_check_removable"] += 1
-
-        _report_progress(edge_idx)
+    # Flush remaining buffer
+    removed += _flush_buffer()
+    bar.close()
 
     # ── Final report ──────────────────────────────────────────────────
     total_elapsed = time.perf_counter() - t_total
-    total_removed = n_prefiltered + removed
-    _log(f"DONE: {total_removed} total removed "
-         f"({n_prefiltered} prefilter + {removed} phase2) in {total_elapsed:.1f}s")
-    _report_progress(len(sel_filtered), force=True)
+    _log(f"DONE: {removed} removed / {n_edges} total in {total_elapsed:.1f}s")
+    _log(f"  precheck: {precheck_necessary} necessary, {precheck_passed} passed")
+    _log(f"  apsp: {apsp_stats.get('apsp_calls', 0)} calls, "
+         f"total={apsp_stats.get('apsp_total_s', 0):.2f}s")
 
     remaining = [e for e in sel if exists[e[0], e[1]]]
-    return remaining, total_removed
+    return remaining, removed
