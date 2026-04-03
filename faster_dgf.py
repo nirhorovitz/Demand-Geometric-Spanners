@@ -215,6 +215,7 @@ def _bisect_batch(
     batch: list[tuple[int, int, float]],
     apsp_stats: dict,
     bisect_stats: dict,
+    edge_bar: tqdm | None = None,
 ) -> int:
     """
     All edges in *batch* are already removed from csr.
@@ -235,6 +236,8 @@ def _bisect_batch(
         for p, q, _w in batch:
             exists[p, q] = False
             exists[q, p] = False
+        if edge_bar:
+            edge_bar.update(len(batch))
         return len(batch)
 
     # Single edge that causes violation → necessary, restore it
@@ -242,6 +245,8 @@ def _bisect_batch(
         p, q, w = batch[0]
         _csr_restore(csr, p, q, w)
         bisect_stats["necessary"] += 1
+        if edge_bar:
+            edge_bar.update(1)
         return 0
 
     # Restore all, then recurse on both halves
@@ -254,12 +259,12 @@ def _bisect_batch(
     # Process first half (longer/heavier edges)
     for p, q, _w in first_half:
         _csr_remove(csr, p, q)
-    first_removed = _bisect_batch(csr, exists, dist_np, n, t, first_half, apsp_stats, bisect_stats)
+    first_removed = _bisect_batch(csr, exists, dist_np, n, t, first_half, apsp_stats, bisect_stats, edge_bar)
 
     # Process second half (shorter/lighter edges)
     for p, q, _w in second_half:
         _csr_remove(csr, p, q)
-    second_removed = _bisect_batch(csr, exists, dist_np, n, t, second_half, apsp_stats, bisect_stats)
+    second_removed = _bisect_batch(csr, exists, dist_np, n, t, second_half, apsp_stats, bisect_stats, edge_bar)
 
     return first_removed + second_removed
 
@@ -324,7 +329,8 @@ def faster_dgf_one_pass(
 
     # ── Buffer edges into batches, bisect each ────────────────────────
     n_batches = (n_edges + _BATCH_SIZE - 1) // _BATCH_SIZE
-    bar = tqdm(total=n_batches, desc="dgf", unit="batch", leave=False)
+    edge_bar = tqdm(total=n_edges, desc="dgf(edges)", unit="edge", leave=False)
+    batch_bar = tqdm(total=n_batches, desc="dgf(batch)", unit="batch", leave=False)
 
     for batch_start in range(0, n_edges, _BATCH_SIZE):
         batch_end = min(batch_start + _BATCH_SIZE, n_edges)
@@ -335,20 +341,21 @@ def faster_dgf_one_pass(
             _csr_remove(csr, p, q)
 
         # Bisect
-        r = _bisect_batch(csr, exists, dist_np, n, t, batch, apsp_stats, bisect_stats)
+        r = _bisect_batch(csr, exists, dist_np, n, t, batch, apsp_stats, bisect_stats, edge_bar)
         removed += r
 
         settled = removed + bisect_stats["necessary"]
-        _log(f"batch {batch_start//(_BATCH_SIZE)+1}/{n_batches}: "
+        _log(f"batch {batch_start//_BATCH_SIZE+1}/{n_batches}: "
              f"+{r}/{len(batch)} removed | "
              f"settled={settled}/{n_edges} ({100*settled/n_edges:.1f}%) | "
              f"removed={removed} necessary={bisect_stats['necessary']} | "
              f"apsp: {apsp_stats.get('apsp_calls', 0)} calls, "
              f"{apsp_stats.get('apsp_total_s', 0):.1f}s | "
              f"elapsed={time.perf_counter()-t_total:.1f}s")
-        bar.update(1)
+        batch_bar.update(1)
 
-    bar.close()
+    edge_bar.close()
+    batch_bar.close()
 
     # ── Final report ──────────────────────────────────────────────────
     total_elapsed = time.perf_counter() - t_total
