@@ -3,6 +3,9 @@ results/*
 !results/.gitkeep
 results_final_experiment_*/
 
+# Native / Rust build artifacts
+native_dgf/
+
 # OS / IDE
 .DS_Store
 .cursor/
