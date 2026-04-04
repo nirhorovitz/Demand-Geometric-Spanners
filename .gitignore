@@ -1,0 +1,26 @@
+# Results
+results/*
+!results/.gitkeep
+results_final_experiment_*/
+
+# OS / IDE
+.DS_Store
+.cursor/
+.vscode/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Virtual environment
+.venv/
+
+# Task vector
+.taskvector/
