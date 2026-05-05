@@ -1,0 +1,337 @@
+\documentclass{article}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{graphicx}
+\usepackage{geometry}
+\geometry{a4paper, margin=1in}
+
+
+
+
+\newcommand{\old}[1]{{}}
+\newtheorem{theorem}{Theorem}
+\newtheorem{corollary}{Corollary}
+\newtheorem{conjecture}[theorem]{Conjecture}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{claim}[theorem]{Claim}
+\newtheorem{observation}[theorem]{Observation}
+\newtheorem{definition}[theorem]{Definition}
+
+\title{Descending Greedy Filter}
+\author{P. Carmi, N. Horovitz, Y. Yashuk}
+\date{March 2026}
+
+
+
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+ We present a new construction of geometric spanners that demonstrates improved empirical performance over the classical greedy spanner on random point sets. For a range of stretch parameters $t>1$, our method consistently produces spanners with fewer edges and lower total weight while maintaining the desired stretch. To the best of our knowledge, this is the first construction that empirically outperforms the greedy spanner on random point sets in terms of both sparsity and total weight. Although the greedy spanner is widely regarded as the most effective practical construction due to its strong theoretical properties, our experimental results indicate that, on typical random inputs, the proposed construction yields significantly sparser and lighter spanners.
+\end{abstract}
+
+
+
+\section{Introduction}
+Geometric spanners are a central object in computational geometry. Given a set $P$ of points in the plane and a stretch parameter $t \ge 1$, a geometric $t$-spanner is a sparse graph in which the shortest-path distance between any pair of points is at most $t$ times their Euclidean distance. Such structures have been extensively studied due to their applications in network design, approximation algorithms, and distributed systems.
+
+Among the many known constructions, the greedy spanner is widely regarded as the most effective in practice, achieving a favorable trade-off between sparsity, total weight, and stretch. 
+
+In this work, we present a new construction of geometric spanners and evaluate its performance on random point sets. For a range of stretch parameters $t>1$, our method consistently produces spanners with fewer edges and lower total weight than the greedy spanner, while maintaining the desired stretch. To the best of our knowledge, this is the first construction that empirically outperforms the greedy spanner on random point sets in terms of both sparsity and total weight.
+
+In addition to its empirical advantages, our construction shares a key structural property with the greedy spanner: it is edge-minimal with respect to the $t$-spanner condition. That is, removing any edge from the resulting graph violates the stretch requirement. As we discuss later, this property is not satisfied by most classical constructions, such as $\Theta$-graphs, Yao graphs, and WSPD-based spanners.
+
+Our results suggest that, for typical input distributions, it is possible to obtain spanners that are both sparser and lighter than those produced by the greedy algorithm, while preserving strong structural guarantees.
+
+
+\section{The algorithm}
+
+\algrenewcommand{\algorithmiccomment}[1]{\hspace{3em}// #1}
+\begin{algorithm}
+\caption{Descending Greedy Filter}
+\begin{algorithmic}[1]
+\Statex \textbf{Input:} 
+\Statex \hspace{1cm} $P$: a set of $n$ points in $\mathbb{R}^d$.
+\Statex \hspace{1cm} $t$: a real constant s.t. $t > 1$.
+%\Statex \hspace{1cm} $E$: a set of edges to filter, default to the complete graph over $P$.
+\Statex \textbf{Output:} 
+\Statex \hspace{1cm} a set of edges, $E$ s.t. $(P,E)$ is a $t-spanner$ for $P$.
+
+\State sort the $n \choose {2} $ pairs of distinct points in \textbf{non-ascending} order of their distances
+
+(breaking ties arbitrarily) and store them in a list $L$.
+\State $E \leftarrow L$ 
+\For{$(p,q) \in L$ in \textbf{non-ascending} order}
+    \State $E \leftarrow E \setminus (p,q)$
+    \For{$(r,s) \in P \times P$}
+        \If{$\delta_{E}(s,r) > t \cdot |sr|$}
+            \State $E \leftarrow E \cup (p,q)$
+            \State \textbf{break}
+        \EndIf
+    \EndFor
+\EndFor
+\State \Return $E$
+\end{algorithmic}
+\end{algorithm}
+
+
+\clearpage
+
+
+\section{Structural Property}
+A key structural property shared by our construction and the greedy spanner is edge-minimality with respect to the $t$-spanner condition. In both constructions, every edge is essential: removing any edge results in a graph that no longer satisfies the $t$-spanner property. In the greedy spanner, this follows directly from its construction, as each edge is added only when no existing path of stretch at most $t$ connects its endpoints, and thus remains necessary in the final graph. Our construction exhibits the same property—despite being derived from a different principle, every edge is required to preserve the stretch guarantee, and its removal necessarily violates the $t$-spanner condition. To the best of our knowledge, no other classical geometric spanner construction guarantees this edge-minimality property. This highlights a strong structural similarity between the two constructions, despite their significant differences in design and empirical performance.
+
+Most classical geometric spanner constructions do not guarantee edge-minimality. In particular, well-known approaches such as $\Theta$-graphs, Yao graphs, and WSPD-based spanners construct edges according to predetermined geometric or combinatorial rules rather than necessity with respect to the $t$-spanner condition. As a result, these constructions typically include redundant edges, in the sense that some edges can be removed without violating the stretch requirement.
+
+A common optimization in the construction of geometric spanners is to first compute a $(t/t')$-spanner (for example, using a $\Theta$-graph, Yao graph, or WSPD-based construction), and then apply the greedy algorithm with parameter $t'$ on this sparse subgraph. While this approach reduces the number of candidate edges, it does not, in general, preserve the edge-minimality property. Indeed, since the greedy procedure is restricted to a predefined subset of edges, it may include edges that would be redundant if all pairwise edges were available, and thus the resulting graph need not be edge-minimal.
+
+For example, let $a=(0,\frac{1}{2})$, $b=(0,- \frac{1}{2})$ $c=(\frac{\sqrt{t^2-1}}{2} ,0)$, and $d=(\frac{\sqrt{(3t+1)(5t-1)}}{2(t-1)} ,0)$.
+
+
+\section{Filtering a $t-spanner$}
+
+\begin{algorithm}
+\caption{Descending Greedy Filter on t-spanner}
+\begin{algorithmic}[1]
+\Statex \textbf{Input:} 
+\Statex \hspace{1cm} $P$: a set of $n$ points in $\mathbb{R}^d$.
+\Statex \hspace{1cm} $t$: a real constant s.t. $t > 1$.
+\Statex \hspace{1cm} $E_i$: a $t-spanner$ for P.
+\Statex \textbf{Output:} 
+\Statex \hspace{1cm} a set of edges, $E$ s.t. $E \subseteq E_i$, $(P,E)$ is a $t-spanner$ for $P$.
+
+\State sort $E_i$ in \textbf{non-ascending} order of their distances
+
+(breaking ties arbitrarily) and store them in a list $L$.
+\State $E \leftarrow L$ 
+\For{$(p,q) \in L$ in \textbf{non-ascending} order}
+    \State $E \leftarrow E \setminus (p,q)$
+    \For{$(r,s) \in P \times P$}
+        \If{$\delta_{E}(s,r) > t \cdot |sr|$}
+            \State $E \leftarrow E \cup (p,q)$
+            \State \textbf{break}
+        \EndIf
+    \EndFor
+\EndFor
+\State \Return $E$
+\end{algorithmic}
+\end{algorithm}
+
+We will prove that if fed with $E_i$, a $t-spanner$, the output $E$ of DGF will be:
+\begin{enumerate}
+    \item $E$ is a $t-spanner$ for $P$.
+    \item $E$ is $t-minimal$.
+\end{enumerate}
+
+\subsection{Proof:}
+
+The first property is trivial.\\
+the second:\\
+let $(p,q) \in E$, need to prove: $\exists (r, s) \in P^2, \delta_{E \setminus (p,q)}(r,s) > t \cdot |r s|$.\\
+denote $E'$ as the state of $E$ when DGF inspected $(p,q)$.\\
+observe $E \subseteq E'$, because the algorithm only removes edges.\\
+because $(p,q) \in E$ then  $\exists (r, s) \in P^2, \delta_{E' \setminus (p,q)}(r,s) > t \cdot |r s|$.\\
+because $E \subseteq E'$, than  $ \delta_{E \setminus (p,q)}(r,s) \geq \delta_{E' \setminus (p,q)}$.\\
+and we get:\\
+$\delta_{E \setminus (p,q)}(r,s) \geq \delta_{E' \setminus (p,q)}(r,s) > t \cdot |r s|$\\
+so $\delta_{E \setminus (p,q)}(r,s) > t \cdot |r s|$, as needed.\\
+
+\section{Proofs}
+
+
+\subsection{Bounded Weight}
+
+Denote $G_{dgf} = (P, E_f)$ as the output of the Descending Greedy Filter algorithm. \\
+Denote $n = |P|$.
+
+\subsubsection{If $t=n-1$ than $\text{MST}(P) = \text{DGF}(P)$}
+
+Assume $t = n-1$, need to prove:
+\begin{enumerate}
+    \item $\text{MST}(P) \subseteq \text{DGF}(P)$
+    \item $\text{DGF}(P) \subseteq \text{MST}(P)$
+\end{enumerate}
+
+\textbf{Prove $\text{MST}(P) \subseteq \text{DGF}(P)$:}\\
+Let $(a,b) \in \text{MST}(P)$; need to prove $(a,b) \in \text{DGF}(P)$.\\
+Assume for contradiction $(a,b) \notin \text{DGF}(P)$, so when DGF checked $(a,b)$ there was a path:\\
+$R = (a = v_1, v_2, \ldots, v_k = b)$ such that:
+
+\begin{enumerate}
+    \item[(a)] $\forall i \in [1, k-1] : |v_i v_{i+1}| \leq |ab|$
+    \item[(b)] $\mathrm{wt}(R) = \sum_{i=1}^{k-1} |v_i v_{i+1}| \leq t \cdot |ab|$
+\end{enumerate}
+So when using Kruskal's algorithm for finding the MST (needs citation), when checking $(a,b)$, the vertices $a$ and $b$ must already be in the same connected component.
+Therefore it will not choose $(a,b)$ for $\text{MST}(P)$, a contradiction.
+\\\\
+
+\textbf{Prove $\text{DGF}(P) \subseteq \text{MST}(P)$:}\\
+Let $(a,b) \in \text{DGF}(P)$; we need to prove $(a,b) \in \text{MST}(P)$.\\
+Because $(a,b) \in \text{DGF}(P)$, there exist $x, y \in P$ such that
+\[
+    \delta_{E_f \setminus (a,b)}(x,y) > t \cdot |xy|.
+\]
+Take these $x, y$ and denote $R = \delta_{E_f \setminus (a,b)}(x,y)$.
+
+We will prove that $|ab| \leq |xy|$.
+Assume for contradiction $|xy| < |ab|$; then when DGF inspected $(a,b)$, the edge $(x,y)$ was still in $E_f$ and must have been valid.
+
+We divide into two cases:
+
+\textbf{Case (a):} $\mathrm{wt}(R) < \infty$.
+
+Then $R = (x = v_1, v_2, \ldots, v_k = y)$. Since $R$ is a shortest path it is simple, so $k \leq n-1$. Therefore
+\[
+    \mathrm{wt}(R) = \sum_{i=1}^{k-1} |v_i v_{i+1}| \leq k \cdot |ab| \leq (n-1)|ab| \leq (n-1) \cdot |xy| = t \cdot |xy|.
+\]
+So $R$ is a valid path between $x$ and $y$ not using $(a,b)$, a contradiction. This case is impossible.
+
+\textbf{Case (b):} $\mathrm{wt}(R) = \infty$.
+
+Then $x$ and $y$ are in different connected components; denote them as $X$ and $Y$.
+
+We will prove that when running Prim's algorithm for finding the MST (needs citation), the edge $(a,b)$ will be selected.
+
+When DGF removed $(a,b)$ to inspect it, $X$ and $Y$ became disconnected. Hence all other edges between $X$ and $Y$ had already been removed by DGF, meaning they are all longer than $(a,b)$. Therefore Prim's algorithm must select $(a,b)$.
+
+So $(a,b) \in \text{MST}(P)$.
+
+\subsection{t-minimal Conjecture}
+
+\subsubsection{t-minimal Property Definition:}
+
+A set of edges $E$ conforms to the $t-minimal$ property if:
+\begin{enumerate}
+    \item $E$ is a $t-spanner$ for $P$.
+    \item for all $(p,q) \in E$, exists a pair $r,s \in P^2$ such that $\delta_{E \setminus (p,q)}(r,s) > t \cdot |x y|$\\
+\end{enumerate}
+Or in a formal mathematical writing:\\
+\[
+\forall (p,q) \in E, \exists (r, s) \in P^2, \delta_{E \setminus (p,q)}(r,s) > t \cdot |x y|.
+\]
+
+\begin{conjecture}
+    If $E$ is $t-minimal$, then $wt(E) = O(wt(MST(P)))$\\
+\end{conjecture}
+%
+\begin{conjecture}
+    $wt(DGF(P)) = O(wt(MST(P)))$\\
+\end{conjecture}
+
+
+\section{Faster Implementation via Binary Search}
+
+The na\"ive implementation of the Descending Greedy Filter (Algorithm~1) iterates over all edges one by one, and for each edge performs an all-pairs shortest path (APSP) computation to check whether its removal causes a violation. This results in $\Theta(m)$ APSP calls, where $m = \binom{n}{2}$ is the total number of edges. We observe that, in practice, the vast majority of edges are removable and only a small subset is necessary. This motivates a binary search approach that can certify large groups of removable edges with a single APSP call.
+
+\subsection{Key Observation}
+
+Let $E$ be the current edge set sorted in non-ascending order by weight, and let $S \subseteq E$ be a contiguous batch of edges. If removing all edges of $S$ from $E$ causes no violation of the $t$-spanner condition (i.e., for all $r, s \in P$, $\delta_{E \setminus S}(r,s) \le t \cdot |rs|$), then every edge in $S$ is removable. This allows us to eliminate an entire batch with a single APSP computation. When a violation is detected, we split the batch and recurse on each half to identify the necessary edges.
+
+\subsection{Algorithm}
+
+\begin{algorithm}
+\caption{Descending Greedy Filter with Binary Search}
+\begin{algorithmic}[1]
+\Statex \textbf{Input:}
+\Statex \hspace{1cm} $P$: a set of $n$ points in $\mathbb{R}^d$.
+\Statex \hspace{1cm} $t$: a real constant s.t.\ $t > 1$.
+\Statex \textbf{Output:}
+\Statex \hspace{1cm} A set of edges $E$ s.t.\ $(P, E)$ is a $t$-spanner for $P$.
+
+\State Sort all $\binom{n}{2}$ pairs in \textbf{non-ascending} order by distance into a list $L$.
+\State $E \leftarrow L$
+\State $E \leftarrow \textsc{Bisect}(E, L, P, t)$
+\State \Return $E$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}
+\caption{\textsc{Bisect}$(E, S, P, t)$}
+\begin{algorithmic}[1]
+\Statex \textbf{Input:}
+\Statex \hspace{1cm} $E$: current edge set.
+\Statex \hspace{1cm} $S$: a batch of candidate edges to remove (already removed from $E$), sorted in non-ascending order by weight.
+\Statex \hspace{1cm} $P, t$: point set and stretch parameter.
+\Statex \textbf{Output:}
+\Statex \hspace{1cm} Updated edge set $E$ with removable edges from $S$ discarded.
+
+\If{$S = \emptyset$}
+    \State \Return $E$
+\EndIf
+\State Compute APSP on $(P, E)$
+\If{$\forall (r,s) \in P \times P$: $\delta_E(r,s) \le t \cdot |rs|$}
+    \State \Return $E$ \Comment{No violation: all edges in $S$ are removable}
+\EndIf
+\If{$|S| = 1$}
+    \State $E \leftarrow E \cup S$ \Comment{Single necessary edge: restore it}
+    \State \Return $E$
+\EndIf
+\State Split $S$ into $S_1$ (first half) and $S_2$ (second half)
+\State $E \leftarrow E \cup S$ \Comment{Restore all edges in $S$}
+\State $E \leftarrow E \setminus S_1$
+\State $E \leftarrow \textsc{Bisect}(E, S_1, P, t)$ \Comment{Recurse on first half (longer edges)}
+\State $E \leftarrow E \setminus S_2$
+\State $E \leftarrow \textsc{Bisect}(E, S_2, P, t)$ \Comment{Recurse on second half (shorter edges)}
+\State \Return $E$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Correctness}
+
+The binary search implementation produces the same output as the na\"ive algorithm. Each edge is either certified as removable (when the entire batch containing it passes the violation check) or identified as necessary (when the recursion reaches a single-edge base case with a violation). Since the edges are processed in the same non-ascending order and the removal/restoration operations are symmetric, the final edge set is identical to that of Algorithm~1.
+
+\subsection{Time Complexity}
+
+Let $m$ denote the number of input edges and let $k$ denote the number of necessary edges in the output (i.e., $k = |E|$ in the final spanner). Let $T_{\mathrm{APSP}}(n)$ denote the cost of a single APSP computation.
+
+\paragraph{APSP calls.}
+Each necessary edge induces a root-to-leaf path in the recursion tree of depth at most $\lceil \log_2 m \rceil$, contributing $O(\log m)$ APSP calls. Each such path terminates at a single-edge base case where the edge is restored. Conversely, groups of removable edges are eliminated at internal nodes without further recursion. The total number of APSP calls is therefore
+\[
+    O(k \log m),
+\]
+where $k$ is the number of necessary edges.
+
+\paragraph{Overall complexity.}
+Sorting the edges takes $O(m \log m)$ time. The binary search performs $O(k \log m)$ APSP calls. Each APSP computation uses Dijkstra from all $n$ sources, costing $O(n(m + n \log n))$. In addition, each level of the recursion performs $O(m)$ total work for edge removal and restoration in the CSR data structure. The total time complexity is therefore
+\[
+    O\!\left(m \log m + k \log m \cdot n(m + n \log n)\right).
+\]
+
+\paragraph{Comparison with the na\"ive approach.}
+The na\"ive implementation performs exactly $m$ APSP calls, for a total cost of $O(m \cdot n(m + n \log n))$. The binary search reduces this to $O(k \log m \cdot n(m + n \log n))$. Since geometric $t$-spanners have $k = O(n)$ edges while $m = \Theta(n^2)$, the speedup factor is
+\[
+    \frac{m}{k \log m} = \frac{\Theta(n^2)}{O(n \log n)} = \Omega\!\left(\frac{n}{\log n}\right),
+\]
+yielding a near-linear improvement in the number of APSP calls.
+
+\paragraph{Concrete bounds assuming $k = O(n)$.}
+We summarize the total time complexity for the two natural input scenarios, assuming the output spanner has $k = O(n)$ necessary edges.
+
+\begin{itemize}
+    \item \textbf{Complete graph input} ($m = \binom{n}{2} = O(n^2)$).
+    Each APSP costs $O(n(n^2 + n \log n)) = O(n^3)$:
+    \[
+        O(n^2 \log n + n \log n \cdot n^3) = O(n^4 \log n).
+    \]
+
+    \item \textbf{$t$-spanner input} ($m = O(n)$).
+    Each APSP costs $O(n(n + n \log n)) = O(n^2 \log n)$:
+    \[
+        O(n \log n + n \log n \cdot n^2 \log n) = O(n^3 \log^2 n).
+    \]
+\end{itemize}
+
+\noindent When the input is already a $t$-spanner with $O(n)$ edges, the total complexity improves from $O(n^4 \log n)$ to $O(n^3 \log^2 n)$.
+
+
+\section{initial bibliograpyh}
+
+t-leapfrog definition: https://dl.acm.org/doi/epdf/10.1145/160985.160998
+
+
+\end{document}
